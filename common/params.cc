@@ -119,6 +119,11 @@ ParamKeyType Params::getKeyType(const std::string &key) {
   return static_cast<ParamKeyType>(keys[key]);
 }
 
+/*
+OpenPilotの設定や状態（例: "FINGERPRINT" や "SIMULATION"）を保存する際に、
+クラッシュや電源断があっても破損しないように、安全な方法でファイルを書き込む処理を行います。
+LWN.net にもあるように、「安全なファイル書き込み」の手順に則っています：
+*/
 int Params::put(const char* key, const char* value, size_t value_size) {
   // Information about safely and atomically writing a file: https://lwn.net/Articles/457667/
   // 1) Create temp file
@@ -126,32 +131,54 @@ int Params::put(const char* key, const char* value, size_t value_size) {
   // 3) fsync() the temp file
   // 4) rename the temp file to the real name
   // 5) fsync() the containing directory
+
+  // 一時ファイル用パスを作成
   std::string tmp_path = params_path + "/.tmp_value_XXXXXX";
+
+  // 一時ファイルを作成し、ファイルディスクリプタを取得
   int tmp_fd = mkstemp((char*)tmp_path.c_str());
+
+  // 作成失敗時はエラーを返す
   if (tmp_fd < 0) return -1;
 
   int result = -1;
   do {
+    // 一時ファイルに value の内容を書き込む
     // Write value to temp.
     ssize_t bytes_written = HANDLE_EINTR(write(tmp_fd, value, value_size));
+
+    /*
+    bytes_written < 0
+       => write() システムコールが失敗した（例：ディスクエラー、パーミッションエラーなど）場合
+
+    (size_t)bytes_written != value_size)
+       => write() に成功したが、「要求したサイズ value_size」と「実際に書けたサイズ bytes_written」が異なる場合
+    */
     if (bytes_written < 0 || (size_t)bytes_written != value_size) {
-      result = -20;
+      result = -20; // 書き込み失敗
       break;
     }
 
+    // 書き込んだ内容をディスクに強制反映
     // fsync to force persist the changes.
     if ((result = HANDLE_EINTR(fsync(tmp_fd))) < 0) break;
 
+    // パラメータディレクトリのロックを取得（排他制御）
     FileLock file_lock(params_path + "/.lock");
 
+    // 一時ファイルを正式な名前に変更（アトミック操作）
     // Move temp into place.
     if ((result = rename(tmp_path.c_str(), getParamPath(key).c_str())) < 0) break;
 
+    // 親ディレクトリのfsync（メタデータも含めて反映）
     // fsync parent directory
     result = fsync_dir(getParamPath());
   } while (false);
 
+  // 一時ファイルのFDを閉じる
   close(tmp_fd);
+
+  // 失敗したら一時ファイルを削除
   if (result != 0) {
     ::unlink(tmp_path.c_str());
   }

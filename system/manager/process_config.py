@@ -61,6 +61,13 @@ def or_(*fns):
 def and_(*fns):
   return lambda *args: operator.and_(*(fn(*args) for fn in fns))
 
+"""
+プロセスは3種類に分かれます:
+  クラス名        | 対象                      | 実行方法
+  PythonProcess | Pythonスクリプト           | python -m モジュール名
+  NativeProcess | ネイティブバイナリ           |  ./バイナリ名
+  DaemonProcess | バックグラウンド常駐スクリプト | 特別な起動・PID監視処理つき
+"""
 procs = [
   DaemonProcess("manage_athenad", "system.athena.manage_athenad", "AthenadPid"),
 
@@ -114,4 +121,10 @@ procs = [
   PythonProcess("joystick", "tools.joystick.joystick_control", and_(joystick, iscar)),
 ]
 
+"""
+OpenPilot の **マネージャー（manager.py）**が「どのプロセスを管理すべきか」を定義する 名前→プロセス設定の辞書
+このファイルの前半で定義した関数(def ...)のポインタを、辞書のバリューとして登録している
+prepare()関数は、 PythonProcess, NativeProcessクラスごとに作成されている
+  openpilot/openpilot/system/manager/process.py
+"""
 managed_processes = {p.name: p for p in procs}

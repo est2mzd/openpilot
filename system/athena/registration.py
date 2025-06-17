@@ -29,6 +29,17 @@ def register(show_spinner=False) -> str | None:
   With a backend update to take serial number instead
   of dongle ID to some endpoints, this can be removed
   entirely.
+  
+  2024年3月以降に製造されたすべてのデバイスでは、
+  必要な情報が /persist/ にすべて保存されている。
+
+  この処理（＝register関数の一部）は、
+  それ以前に製造されたデバイス向けの互換性維持のために
+  残されているにすぎない。
+
+  将来的にバックエンド（サーバー側）が、
+  dongle ID の代わりに serial number を受け取るように更新されれば、
+  この関数全体は完全に削除可能となる。
   """
   params = Params()
 

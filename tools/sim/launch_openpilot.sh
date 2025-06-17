@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 
-export PASSIVE="0"
-export NOBOARD="1"
-export SIMULATION="1"
-export SKIP_FW_QUERY="1"
+export PASSIVE="0"        # 車両の制御を有効化（0=アクティブモード、1=パッシブモード）
+export NOBOARD="1"        # 通常はboarddによるハードウェア通信をスキップ（仮想CAN使用）
+export SIMULATION="1"     # シミュレーションモードでOpenPilotを動かすためのフラグ
+export SKIP_FW_QUERY="1"  # ファームウェアのスキャンをスキップ（実車での初回検出を省略）
 export FINGERPRINT="HONDA_CIVIC_2022"
 
+# 不要なプロセスをブロック：カメラ、ログ、エンコーダ、マイク入力など
 export BLOCK="${BLOCK},camerad,loggerd,encoderd,micd,logmessaged"
+
+
 if [[ "$CI" ]]; then
   # TODO: offscreen UI should work
   export BLOCK="${BLOCK},ui"
 fi
 
+# Pythonを使って、パラメータ設定. params.ccに実体がある
 python3 -c "from openpilot.selfdrive.test.helpers import set_params_enabled; set_params_enabled()"
 
+
+# 以降は、フォルダを移動し、openpilot/system/manager/manager.py　を実行しているだけ
 SCRIPT_DIR=$(dirname "$0")
 OPENPILOT_DIR=$SCRIPT_DIR/../../
 
