@@ -9,6 +9,35 @@ from openpilot.tools.sim.bridge.metadrive.metadrive_common import RGBCameraRoad,
 from openpilot.tools.sim.bridge.metadrive.metadrive_world import MetaDriveWorld
 from openpilot.tools.sim.lib.camerad import W, H
 
+"""
+
+"""
+import copy
+from metadrive.envs.base_env import BASE_DEFAULT_CONFIG
+
+my_vehicle_config_2 = copy.deepcopy(BASE_DEFAULT_CONFIG["vehicle_config"])
+my_vehicle_config_2.update(dict(
+  enable_reverse=False,
+  render_vehicle=False,
+  image_source="rgb_road",
+  spawn_lane_index=("S", "E", 0),
+  destination=("E", "X", 0)
+))
+
+my_vehicle_config_1 = {
+  "enable_reverse": False,
+  "render_vehicle": False,
+  "image_source": "rgb_road"
+}
+
+my_vehicle_config_3 = {
+  "vehicle_model": "s",
+  "enable_reverse": False,
+  "image_source": "rgb_road",
+  "spawn_longitude": 15
+}
+
+#----------------------------------------------------------#
 
 def straight_block(length):
   return {
@@ -27,7 +56,7 @@ def curve_block(length, angle=45, direction=0):
     "dir": direction
   }
 
-def create_map(track_size=60):
+def create_map(track_size=200):
   curve_len = track_size * 2
   return dict(
     type=MapGenerateMethod.PG_MAP_FILE,
@@ -67,11 +96,7 @@ class MetaDriveBridge(SimulatorBridge):
 
     config = dict(
       use_render=self.should_render,
-      vehicle_config=dict(
-        enable_reverse=False,
-        render_vehicle=False,
-        image_source="rgb_road",
-      ),
+      vehicle_config=my_vehicle_config_3,
       sensors=sensors,
       image_on_cuda=_cuda_enable,
       image_observation=True,
@@ -91,3 +116,11 @@ class MetaDriveBridge(SimulatorBridge):
     )
 
     return MetaDriveWorld(queue, config, self.test_duration, self.test_run, self.dual_camera)
+
+"""
+vehicle_config=dict(
+  enable_reverse=False,
+  render_vehicle=False,
+  image_source="rgb_road",
+),
+"""
