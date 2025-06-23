@@ -15,6 +15,8 @@ from openpilot.tools.sim.lib.camerad import W, H
 import copy
 from metadrive.envs.base_env import BASE_DEFAULT_CONFIG
 
+print(f"_cuda_enable = {_cuda_enable}")
+
 my_vehicle_config_2 = copy.deepcopy(BASE_DEFAULT_CONFIG["vehicle_config"])
 my_vehicle_config_2.update(dict(
   enable_reverse=False,
@@ -26,7 +28,7 @@ my_vehicle_config_2.update(dict(
 
 my_vehicle_config_1 = {
   "enable_reverse": False,
-  "render_vehicle": False,
+  #"render_vehicle": False,
   "image_source": "rgb_road"
 }
 
@@ -96,7 +98,7 @@ class MetaDriveBridge(SimulatorBridge):
 
     config = dict(
       use_render=self.should_render,
-      vehicle_config=my_vehicle_config_3,
+      vehicle_config=my_vehicle_config_1,
       sensors=sensors,
       image_on_cuda=_cuda_enable,
       image_observation=True,
@@ -106,13 +108,13 @@ class MetaDriveBridge(SimulatorBridge):
       crash_vehicle_done=False,
       crash_object_done=False,
       arrive_dest_done=False,
-      traffic_density=0.0, # traffic is incredibly expensive
+      traffic_density=0.02, # traffic is incredibly expensive
       map_config=create_map(),
       decision_repeat=1,
       physics_world_step_size=self.TICKS_PER_FRAME/100,
       preload_models=False,
       show_logo=False,
-      anisotropic_filtering=False
+      #anisotropic_filtering=False # TODO-MOD-BY-KOBA
     )
 
     return MetaDriveWorld(queue, config, self.test_duration, self.test_run, self.dual_camera)

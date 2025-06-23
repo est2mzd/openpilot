@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 import os
 from openpilot.system.hardware import TICI
+
 USBGPU = "USBGPU" in os.environ
+
+# TODO : MOD BY KOBA
 if USBGPU:
+  # Comma device with usb-gpu ?
   os.environ['AMD'] = '1'
   os.environ['AMD_IFACE'] = 'USB'
 elif TICI:
+  # Comma device
   from openpilot.selfdrive.modeld.runners.tinygrad_helpers import qcom_tensor_from_opencl_address
   os.environ['QCOM'] = '1'
 else:
+  # Setting for CPU
   os.environ['LLVM'] = '1'
   os.environ['JIT'] = '2'
+
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
 import time
