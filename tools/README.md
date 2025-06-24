@@ -48,6 +48,22 @@ source .venv/bin/activate
 scons -u -j$(nproc)
 ```
 
+**6. Install CUDA Library**
+```
+cd ~/openpilot/docker
+./setup_additional_pip.sh
+
+# Check library installtaion status
+python ./check_cuda.py
+```
+
+**6. Install metadrive**
+```
+cd ~/openpilot/metadrive
+pip3 install -e .
+```
+
+
 ## WSL on Windows
 
 [Windows Subsystem for Linux (WSL)](https://docs.microsoft.com/en-us/windows/wsl/about) should provide a similar experience to native Ubuntu. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/compare-versions) specifically has been reported by several users to be a seamless experience.
