@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+from pathlib import Path
 from openpilot.system.hardware import TICI
 
 USBGPU = "USBGPU" in os.environ
@@ -15,8 +16,13 @@ elif TICI:
   os.environ['QCOM'] = '1'
 else:
   # Setting for CPU
-  os.environ['LLVM'] = '1'
-  os.environ['JIT'] = '2'
+  # os.environ['LLVM'] = '1'
+  # os.environ['JIT'] = '2'
+  import json
+  with open(Path(__file__).parent / 'models/modeld_flags.json') as f:
+    flags = json.load(f)
+    os.environ.update(flags)
+  
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
@@ -25,7 +31,7 @@ import pickle
 import numpy as np
 import cereal.messaging as messaging
 from cereal import car, log
-from pathlib import Path
+# from pathlib import Path
 from setproctitle import setproctitle
 from cereal.messaging import PubMaster, SubMaster
 from msgq.visionipc import VisionIpcClient, VisionStreamType, VisionBuf
