@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 
-# TODO : MOD BY KOBA
-# export CUDA=1 # modeld.py の 上部で推論は強制的にCPUにされているので意味がない
-# でも、cupyの設定をすれば、metadrive自体はGPUで動く。あれ？　わざわざGPUからCPUにデータを移すほうが遅いのでは？
-# 結局、パワーがないとフレーム落ちするよね・・・
 export BLOCK="${BLOCK},soundd" # PC上ではこれが必要
 
 export PASSIVE="0"        # 車両の制御を有効化（0=アクティブモード、1=パッシブモード）
@@ -23,7 +19,6 @@ fi
 
 # Pythonを使って、パラメータ設定. params.ccに実体がある
 python3 -c "from openpilot.selfdrive.test.helpers import set_params_enabled; set_params_enabled()"
-
 
 # 以降は、フォルダを移動し、openpilot/system/manager/manager.py　を実行しているだけ
 SCRIPT_DIR=$(dirname "$0")
