@@ -18,18 +18,37 @@
 class SwaglogState {
 public:
   SwaglogState() {
+    /*
+    zmq（ゼロエムキュー、正式には ZeroMQ）とは、C/C++ を中心に開発された高速・非同期通信のための軽量なメッセージングライブラリ
+      - ソケット風のAPI	zmq_socket() など、UNIXソケットと似た形で扱える
+      - 非同期通信が簡単	ノンブロッキング送信・受信ができる（例：UIとloggerd）
+      - 通信パターンが豊富	PUB/SUB, PUSH/PULL, REQ/REP など
+      - 通信手段が選べる	TCP, IPC（UNIXドメイン）, inproc（プロセス内）など
+      - バッファリングと再送制御あり	自動再接続や送信キューをもつため安定性が高い
+    */
+
+    // ZeroMQのコンテキストを生成（スレッド/ソケット管理の母体）
     zctx = zmq_ctx_new();
+
+    // PUSH型ソケット（送信用）を作成
     sock = zmq_socket(zctx, ZMQ_PUSH);
 
     // Timeout on shutdown for messages to be received by the logging process
     int timeout = 100;
     zmq_setsockopt(sock, ZMQ_LINGER, &timeout, sizeof(timeout));
+
+    // 送信先(Path::swaglog_ipc())へ接続
+    //  デフォルトの送信先 : /tmp/logmessage
     zmq_connect(sock, Path::swaglog_ipc().c_str());
 
     // workaround for https://github.com/dropbox/json11/issues/38
+    // JSONの数値表現におけるロケール問題への回避策
     setlocale(LC_NUMERIC, "C");
 
+    // デフォルトのログ出力レベルを WARNING に設定
     print_level = CLOUDLOG_WARNING;
+
+    // 環境変数 LOGPRINT に応じてログ出力レベルを変更可能（開発者向け）
     if (const char* print_lvl = getenv("LOGPRINT")) {
       if (strcmp(print_lvl, "debug") == 0) {
         print_level = CLOUDLOG_DEBUG;
@@ -40,25 +59,28 @@ public:
       }
     }
 
+    // ログに含める共通コンテキスト情報（システムメタデータ）を構築
     ctx_j = json11::Json::object{};
     if (char* dongle_id = getenv("DONGLE_ID")) {
-      ctx_j["dongle_id"] = dongle_id;
+      ctx_j["dongle_id"] = dongle_id; // デバイス固有ID
     }
     if (char* git_origin = getenv("GIT_ORIGIN")) {
-      ctx_j["origin"] = git_origin;
+      ctx_j["origin"] = git_origin; // Gitリポジトリ情報
     }
     if (char* git_branch = getenv("GIT_BRANCH")) {
-      ctx_j["branch"] = git_branch;
+      ctx_j["branch"] = git_branch; // Gitブランチ名
     }
     if (char* git_commit = getenv("GIT_COMMIT")) {
-      ctx_j["commit"] = git_commit;
+      ctx_j["commit"] = git_commit; // Gitコミットハッシュ
     }
     if (char* daemon_name = getenv("MANAGER_DAEMON")) {
-      ctx_j["daemon"] = daemon_name;
+      ctx_j["daemon"] = daemon_name; // 起動しているデーモン名
     }
-    ctx_j["version"] = COMMA_VERSION;
-    ctx_j["dirty"] = !getenv("CLEAN");
-    ctx_j["device"] = Hardware::get_name();
+    ctx_j["version"] = COMMA_VERSION;       // ビルドされたOpenPilotのバージョン
+    ctx_j["dirty"] = !getenv("CLEAN");      // コード変更があるかどうか（未コミットあり）
+
+    // Hardwareクラスは、上部で環境ごとの設定がされている
+    ctx_j["device"] = Hardware::get_name(); // 実行中デバイスの名称（ticiなど）
   }
 
   ~SwaglogState() {
@@ -67,10 +89,15 @@ public:
   }
 
   void log(int levelnum, const char* filename, int lineno, const char* func, const char* msg, const std::string& log_s) {
+    // スレッドセーフにするためロック（RAIIパターン：スコープ終了で自動解放）
     std::lock_guard lk(lock);
+
+    // ログの重要度が設定された出力レベル以上であれば、標準出力に表示
     if (levelnum >= print_level) {
       printf("%s: %s\n", filename, msg);
     }
+
+    // ZeroMQ を使ってログメッセージを非同期送信（失敗してもブロックしない）
     zmq_send(sock, log_s.data(), log_s.length(), ZMQ_NOBLOCK);
   }
 

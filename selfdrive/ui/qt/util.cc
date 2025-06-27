@@ -98,10 +98,33 @@ void sigTermHandler(int s) {
 }
 
 void initApp(int argc, char *argv[], bool disable_hidpi) {
+  // 下記ファイルに詳細コメントを追記
+  //    openpilot/system/hardware/tici/hardware.h
+
+  // ディスプレイの電源をオンにする
+  //  openpilot/system/hardware/tici/hardware.h にて sysfs 経由でバックライトを制御している
   Hardware::set_display_power(true);
+
+  // ディスプレイの明るさを 65% に設定（0〜100%）
+  //  実体は `/sys/class/backlight/panel0-backlight/brightness` への書き込み
   Hardware::set_brightness(65);
 
   // setup signal handlers to exit gracefully
+  /*
+  Linux では、プロセスに対して「終了しろ」「再起動しろ」などの命令を送るために「シグナル（signal）」という仕組みがあります
+  代表的なシグナル
+    SIGINT	割り込み	ターミナルで Ctrl+C を押したときに送られる
+    SIGTERM	終了要求	kill <PID> コマンドで送信される（優しい終了）
+    SIGKILL	強制終了	kill -9 <PID>（ハンドラ不可） 
+
+  std::signal() の役割
+    std::signal(SIGINT, sigTermHandler);
+    「SIGINT が届いたら sigTermHandler 関数を呼んでね」という コールバック登録
+
+  つまり、Ctrl+C や kill を受け取ったときに、いきなり終了せず
+  後始末（ログ保存・シャットダウン処理など）をしてから安全に終了
+  できるようにしている
+  */
   std::signal(SIGINT, sigTermHandler);
   std::signal(SIGTERM, sigTermHandler);
 
@@ -125,6 +148,7 @@ void initApp(int argc, char *argv[], bool disable_hidpi) {
 }
 
 void swagLogMessageHandler(QtMsgType type, const QMessageLogContext &context, const QString &msg) {
+  // Qt のログレベルを OpenPilot の cloudlog ログレベルにマッピング
   static std::map<QtMsgType, int> levels = {
     {QtMsgType::QtDebugMsg, CLOUDLOG_DEBUG},
     {QtMsgType::QtInfoMsg, CLOUDLOG_INFO},
@@ -134,12 +158,24 @@ void swagLogMessageHandler(QtMsgType type, const QMessageLogContext &context, co
     {QtMsgType::QtFatalMsg, CLOUDLOG_CRITICAL},
   };
 
+  // ファイル名と関数名を文字列として初期化
   std::string file, function;
-  if (context.file != nullptr) file = context.file;
-  if (context.function != nullptr) function = context.function;
+  if (context.file != nullptr) file = context.file;             // ログ発生元のファイル名
+  if (context.function != nullptr) function = context.function; // ログ発生元の関数名
 
+  // ログメッセージを UTF-8 に変換
   auto bts = msg.toUtf8();
-  cloudlog_e(levels[type], file.c_str(), context.line, function.c_str(), "%s", bts.constData());
+
+  // OpenPilot 独自の cloudlog にログを出力
+  cloudlog_e(
+    levels[type],            // ログレベル（DEBUG, INFO など）
+    file.c_str(),            // ファイル名
+    context.line,            // 行番号
+    function.c_str(),        // 関数名
+    "%s",                    // フォーマット文字列
+    bts.constData()          // 実際のメッセージ
+  );
+
 }
 
 

@@ -38,6 +38,8 @@ namespace Path {
   }
 
   inline std::string swaglog_ipc() {
+    // IPC （Inter-Process Communication）＝プロセス間通信の方式を指定
+    // /tmp/logmessage : 使用する UNIXドメインソケットのパス（ファイル）
     return "ipc:///tmp/logmessage" + Path::openpilot_prefix();
   }
 

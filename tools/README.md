@@ -22,6 +22,11 @@ or do a full clone:
 git clone --recurse-submodules https://github.com/commaai/openpilot.git
 ```
 
+or 
+```
+git submodule update --init --recursive
+```
+
 **2. Run the setup script**
 
 ``` bash

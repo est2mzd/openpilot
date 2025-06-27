@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 export BLOCK="${BLOCK},soundd" # PC上ではこれが必要
+# export DUAL_CAMERA_VIEW=1 # 画面に２個のカメラ映像を出すときはこれが必要
 
 export PASSIVE="0"        # 車両の制御を有効化（0=アクティブモード、1=パッシブモード）
 export NOBOARD="1"        # 通常はboarddによるハードウェア通信をスキップ（仮想CAN使用）

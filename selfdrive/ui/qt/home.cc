@@ -12,14 +12,26 @@
 // HomeWindow: the container for the offroad and onroad UIs
 
 HomeWindow::HomeWindow(QWidget* parent) : QWidget(parent) {
+  // ホーム画面を水平方向レイアウト＝QHBoxLayoutにする
+  // addWidget()するたびに、左から右に追加される
   QHBoxLayout *main_layout = new QHBoxLayout(this);
-  main_layout->setMargin(0);
-  main_layout->setSpacing(0);
+  main_layout->setMargin(0);  // 外側の余白なし
+  main_layout->setSpacing(0); // 要素間の隙間なし（密着）
 
+  // 左側：サイドバーを追加（設定ボタンなど）
+  //  詳細定義 : openpilot/selfdrive/ui/qt/sidebar.cc
   sidebar = new Sidebar(this);
   main_layout->addWidget(sidebar);
+
+  /*
+  サイドバーで「設定」ボタンが押されたとき( = Sidebar::openSettings)、
+  HomeWindow に openSettings シグナルを送る( = HomeWindow::openSettings)
+  QObject::connect(送信元オブジェクト, シグナルポインタ,
+                 受信先オブジェクト, スロットポインタ);
+  */
   QObject::connect(sidebar, &Sidebar::openSettings, this, &HomeWindow::openSettings);
 
+  // サイドバーの右側に、QStackedLayout()を指定し、複数画面の切り替えができるようにする
   slayout = new QStackedLayout();
   main_layout->addLayout(slayout);
 
@@ -27,6 +39,7 @@ HomeWindow::HomeWindow(QWidget* parent) : QWidget(parent) {
   QObject::connect(home, &OffroadHome::openSettings, this, &HomeWindow::openSettings);
   slayout->addWidget(home);
 
+  // 走行中の画像全体を描画: openpilot/selfdrive/ui/qt/onroad/onroad_home.h/cc
   onroad = new OnroadWindow(this);
   slayout->addWidget(onroad);
 

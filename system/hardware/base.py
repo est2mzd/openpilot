@@ -89,6 +89,29 @@ class LPABase(ABC):
   def switch_profile(self, iccid: str) -> None:
     pass
 
+
+"""
+ABCMeta
+  Python 標準ライブラリの abc モジュールに定義されている 抽象基底クラス(Abstract Base Class)用のメタクラス
+  使い方: from abc import ABCMeta
+  役割：
+    抽象メソッド(@abstractmethod)を定義できるようにする
+    抽象メソッドが未実装のクラスを インスタンス化不可 にする
+    
+metaclass:
+  クラスを定義するための“クラス” を指定する特殊キーワード
+  - 普通のクラス → インスタンスを生成する
+  - メタクラス → クラスそのものを生成する
+    
+class ABC(metaclass=ABCMeta):
+  __slots__ = ()    
+    
+ABC の目的:
+  ABC は ABCMeta を あらかじめ metaclass に持つ クラス
+  自作クラスで ABC を継承するだけで、@abstractmethod を使えるようになります
+  よって、毎回 metaclass=ABCMeta を書かずに済む
+"""
+
 class HardwareBase(ABC):
   @staticmethod
   def get_cmdline() -> dict[str, str]:
