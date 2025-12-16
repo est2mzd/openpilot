@@ -18,6 +18,7 @@ docker run \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -v "${GRANDPARENT_DIR}/openpilot":/home/${USER_NAME}/openpilot \
     -v "${GRANDPARENT_DIR}/others":/home/${USER_NAME}/others \
+    -v "${GRANDPARENT_DIR}/data":/home/${USER_NAME}/data \
     --cap-add=NET_ADMIN \
     --device /dev/net/tun \
     --privileged \
