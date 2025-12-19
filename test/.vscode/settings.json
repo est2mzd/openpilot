@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/ml_test/bin/python",
+    "jupyter.kernels.filter": [],
+    "jupyter.notebookFileRoot": "${workspaceFolder}",
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true
+}

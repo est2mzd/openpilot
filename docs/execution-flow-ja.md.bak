@@ -1,0 +1,2442 @@
+# openpilot プログラム実行フロー
+
+このドキュメントでは、openpilotの起動から実行までの流れを説明します。
+
+## 1. 起動の流れ
+
+```
+launch_openpilot.sh
+    ↓
+launch_chffrplus.sh
+    ↓
+system/manager/manager.py
+    ↓
+各種プロセスの起動
+```
+
+### 起動スクリプト
+
+1. **launch_openpilot.sh** - エントリーポイント
+   - `launch_chffrplus.sh`を呼び出すだけのラッパー
+
+2. **launch_chffrplus.sh** - メイン起動スクリプト
+   - オーバーレイアップデートのチェック
+   - 環境変数の設定（`PYTHONPATH`など）
+   - ハードウェア固有の初期化（AGNOS）
+   - tmuxセッションの作成
+   - `system/manager/manager.py`の起動
+
+## 2. Manager（マネージャー）
+
+**ファイル**: `system/manager/manager.py`
+
+Managerはopenpilotの**中央管理プロセス**で、すべてのサブプロセスの起動・監視・停止を担当します。
+
+### 2.1 初期化処理 (`manager_init()`)
+
+#### Paramsの初期化
+```python
+params = Params()
+params.clear_all(ParamKeyType.CLEAR_ON_MANAGER_START)
+```
+
+**Paramsとは？**
+- openpilotの設定管理システム
+- C++で実装され、Cythonを通じてPythonから利用
+- 関連ファイル:
+  - `openpilot/common/params.h`
+  - `openpilot/common/params.cc`
+  - `openpilot/common/params_pyx.pyx`
+
+#### デバイス登録
+```python
+serial = HARDWARE.get_serial()
+reg_res = register(show_spinner=True)
+dongle_id = reg_res
+```
+
+- ハードウェアのシリアル番号取得
+- comma.aiクラウドへの登録
+- dongle_idの取得（デバイス識別子）
+
+#### ログシステムの初期化
+
+**Sentry**
+- リアルタイムのエラー監視・クラッシュレポートツール
+- 本家comma.aiの公式ビルドかつ実機（TICI）でのみ有効
+- プロセスのクラッシュ情報をクラウドに送信
+
+**cloudlog**
+- openpilot独自のロギングシステム
+- デバイス情報、バージョン、ブランチなどをグローバルにバインド
+
+#### プロセスの事前準備
+```python
+for p in managed_processes.values():
+    p.prepare()
+```
+
+- すべてのプロセスに対して起動前の準備処理を実行
+- 起動可能かどうかを事前にチェック
+
+### 2.2 メインループ (`manager_thread()`)
+
+#### Pub/Sub通信の初期化
+
+openpilotは**共有メモリ**（`/dev/shm`）ベースの独自Pub/Subシステムを使用：
+
+```python
+sm = messaging.SubMaster(['deviceState', 'carParams'], poll='deviceState')
+pm = messaging.PubMaster(['managerState'])
+```
+
+**msgqの仕組み**
+- `/dev/shm`に共有メモリファイルを作成
+- リングバッファ構造でメッセージを管理
+- 実装: `msgq/msgq.cc`
+
+```
+┌────────────┐                         ┌────────────┐
+│ PubMaster  │                         │ SubMaster  │
+└────┬───────┘                         └────┬───────┘
+     │                                       │
+     ▼                                       ▼
+┌──────────────────────┐        ┌────────────────────────┐
+│  共有メモリリングバッファ  │◄──共有──►│ read/write pointer     │
+└──────────────────────┘        └────────────────────────┘
+```
+
+#### 監視ループ
+
+```python
+while True:
+    sm.update(1000)
+    started = sm['deviceState'].started
+
+    # 走行状態の変化を検出
+    if started and not started_prev:
+        params.clear_all(ParamKeyType.CLEAR_ON_ONROAD_TRANSITION)
+    elif not started and started_prev:
+        params.clear_all(ParamKeyType.CLEAR_ON_OFFROAD_TRANSITION)
+
+    # 必要なプロセスを起動・維持
+    ensure_running(managed_processes.values(), started, params=params,
+                   CP=sm['carParams'], not_run=ignore)
+
+    # managerStateを配信
+    pm.send('managerState', msg)
+```
+
+**主な処理**:
+1. `deviceState`の更新を監視（1000ms間隔）
+2. 走行状態（onroad/offroad）の変化を検出
+3. 状態に応じて必要なプロセスを起動/停止
+4. プロセスの状態をmanagerStateとして配信
+
+### 2.3 クリーンアップ (`manager_cleanup()`)
+
+```python
+def manager_cleanup() -> None:
+    # 全プロセスに非同期で停止シグナル送信
+    for p in managed_processes.values():
+        p.stop(block=False)
+
+    # ブロッキングで完全停止を待機
+    for p in managed_processes.values():
+        p.stop(block=True)
+```
+
+**2段階停止の理由**:
+- 同期的に1つずつ止めると時間がかかる
+- 非同期で全プロセスに同時にシグナルを送り、その後完全停止を待つ
+- 並列停止により高速かつ安全にシャットダウン
+
+## 3. プロセス管理
+
+**ファイル**: `system/manager/process_config.py`
+
+### 3.1 プロセスタイプ
+
+openpilotは3種類のプロセスタイプを使い分けます：
+
+| クラス名 | 対象 | 実行方法 |
+|---------|------|---------|
+| **PythonProcess** | Pythonスクリプト | `python -m モジュール名` |
+| **NativeProcess** | ネイティブバイナリ（C/C++） | `./バイナリ名` |
+| **DaemonProcess** | バックグラウンド常駐 | 特別な起動・PID監視処理つき |
+
+実装: `system/manager/process.py`
+
+### 3.2 起動条件関数
+
+各プロセスは起動条件を関数で定義：
+
+```python
+def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
+    return started
+
+def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
+    return True
+
+def iscar(started: bool, params: Params, CP: car.CarParams) -> bool:
+    return started and not CP.notCar
+```
+
+これらの関数を組み合わせて複雑な条件を作成：
+
+```python
+def or_(*fns):
+    return lambda *args: operator.or_(*(fn(*args) for fn in fns))
+
+def and_(*fns):
+    return lambda *args: operator.and_(*(fn(*args) for fn in fns))
+```
+
+### 3.3 主要プロセス一覧
+
+#### 制御系
+
+| プロセス名 | 役割 | タイプ | 起動条件 |
+|----------|------|--------|---------|
+| **controlsd** | 車両制御（ハンドル・アクセル・ブレーキ） | Python | 走行中かつ実車 |
+| **plannerd** | 経路計画 | Python | 走行中（通常モード） |
+| **radard** | レーダー処理 | Python | 走行中 |
+| **card** | 車両インターフェース | Python | 走行中 |
+
+#### 認識系
+
+| プロセス名 | 役割 | タイプ | 起動条件 |
+|----------|------|--------|---------|
+| **modeld** | AIモデル（カメラ画像認識） | Python | 走行中 |
+| **dmonitoringmodeld** | ドライバー監視モデル | Python | 常時またはカメラ利用時 |
+| **camerad** | カメラ入力 | Native | 常時またはドライバービュー時 |
+
+#### 位置推定系
+
+| プロセス名 | 役割 | タイプ | 起動条件 |
+|----------|------|--------|---------|
+| **locationd** | 位置推定 | Python | 走行中 |
+| **calibrationd** | カメラキャリブレーション | Python | 走行中 |
+| **torqued** | トルク推定 | Python | 走行中 |
+| **paramsd** | 車両パラメータ推定 | Python | 走行中 |
+| **ubloxd** | u-blox GPS受信機 | Native | 走行中（TICI、u-blox利用時） |
+| **qcomgpsd** | Qualcomm GPS | Python | 走行中（TICI、Qualcomm利用時） |
+
+#### ロギング系
+
+| プロセス名 | 役割 | タイプ | 起動条件 |
+|----------|------|--------|---------|
+| **loggerd** | ログ記録（動画・データ） | Native | 走行中 |
+| **encoderd** | 動画エンコード | Native | 走行中 |
+| **uploader** | クラウドアップロード | Python | 常時 |
+| **deleter** | 古いログの削除 | Python | 常時 |
+
+#### システム系
+
+| プロセス名 | 役割 | タイプ | 起動条件 |
+|----------|------|--------|---------|
+| **pandad** | Panda（CANデバイス）通信 | Python | 常時 |
+| **ui** | ユーザーインターフェース | Native | 常時 |
+| **soundd** | サウンド出力 | Python | 走行中 |
+| **manage_athenad** | Athena通信管理 | Daemon | 常時（登録済みデバイス） |
+| **hardwared** | ハードウェア管理 | Python | 常時 |
+| **statsd** | 統計情報収集 | Python | 常時 |
+
+#### Athenaとは？
+
+**Athena**は、comma.aiクラウドとの双方向通信インフラ：
+
+- ログのアップロード
+- OTA（Over-The-Air）アップデート
+- リモートSSHアクセス（ブラウザ経由）
+- ライブデータ転送
+
+未登録デバイス（`UNREGISTERED_DONGLE_ID`）では無効化されます。
+
+### 3.4 プロセス定義の構造
+
+```python
+procs = [
+    PythonProcess("controlsd", "selfdrive.controls.controlsd", and_(not_joystick, iscar)),
+    NativeProcess("camerad", "system/camerad", ["./camerad"], driverview, enabled=not WEBCAM),
+    DaemonProcess("manage_athenad", "system.athena.manage_athenad", "AthenadPid"),
+]
+
+managed_processes = {p.name: p for p in procs}
+```
+
+各プロセスは：
+1. **名前** - プロセス識別子
+2. **モジュールパス/実行パス** - 起動対象
+3. **起動条件関数** - いつ起動するか
+4. **有効化フラグ** - プラットフォーム固有の有効/無効
+
+## 4. プロセス間通信（msgq）
+
+### 4.1 アーキテクチャ
+
+openpilotは共有メモリベースのメッセージキューシステムを使用：
+
+```
+┌──────────┐   publish    ┌─────────┐   subscribe   ┌──────────┐
+│ modeld   │──────────────>│  msgq   │<──────────────│controlsd │
+└──────────┘              │(/dev/shm)│              └──────────┘
+                          └─────────┘
+                               ▲
+                               │
+                          ┌────┴────┐
+                          │ cereal  │
+                          └─────────┘
+                       (メッセージ定義)
+```
+
+### 4.2 実装詳細
+
+**共有メモリの場所**:
+- パス: `/dev/shm/` (Ubuntu/Linux)
+- Managerが起動時にディレクトリを作成
+
+**実装ファイル**:
+- `msgq/msgq.cc` - C++実装
+- `cereal/messaging/` - Pythonバインディング
+
+**メッセージ定義**:
+- `cereal/log.capnp` - メインメッセージ定義
+- `cereal/car.capnp` - 車両関連メッセージ
+- Cap'n Protoフォーマットを使用（高速シリアライゼーション）
+
+### 4.3 使用例
+
+**Publisher側**:
+```python
+pm = messaging.PubMaster(['controlsState'])
+msg = messaging.new_message('controlsState')
+msg.controlsState.enabled = True
+pm.send('controlsState', msg)
+```
+
+**Subscriber側**:
+```python
+sm = messaging.SubMaster(['controlsState'])
+while True:
+    sm.update()
+    if sm['controlsState'].enabled:
+        # 処理
+```
+
+## 5. 実行フロー図
+
+### 5.1 起動フロー
+
+```
+[launch_openpilot.sh]
+         │
+         ▼
+[launch_chffrplus.sh]
+         │
+         ├─ オーバーレイアップデート確認
+         ├─ 環境変数設定 (PYTHONPATH)
+         ├─ ハードウェア初期化 (AGNOS)
+         │
+         ▼
+[system/manager/manager.py]
+         │
+         ├─ manager_init()
+         │    ├─ Params初期化
+         │    ├─ デバイス登録 (dongle_id)
+         │    ├─ Sentry初期化
+         │    ├─ cloudlog設定
+         │    └─ 全プロセス準備 (prepare())
+         │
+         ├─ manager_thread()
+         │    │
+         │    └─ メインループ（無限ループ）
+         │         ├─ SubMaster初期化
+         │         ├─ PubMaster初期化
+         │         │
+         │         └─ while True:
+         │              ├─ sm.update() - deviceState監視
+         │              ├─ 走行状態判定 (started)
+         │              ├─ 状態変化時のパラメータクリア
+         │              ├─ ensure_running() - プロセス管理
+         │              └─ managerState配信
+         │
+         └─ [終了時] manager_cleanup()
+              └─ 全プロセス停止
+```
+
+### 5.2 走行時のプロセスフロー
+
+```
+[センサー入力]
+      │
+      ├─ camerad ────────┐
+      ├─ sensord ────────┤
+      ├─ pandad (CAN) ───┤
+      └─ locationd (GPS)─┤
+                         │
+                         ▼
+                   [認識・推定]
+                         │
+      ┌──────────────────┼──────────────────┐
+      │                  │                  │
+      ▼                  ▼                  ▼
+   modeld          calibrationd       paramsd
+ (物体認識)      (キャリブレーション)  (車両パラメータ)
+      │                  │                  │
+      └──────────────────┼──────────────────┘
+                         │
+                         ▼
+                    [経路計画]
+                         │
+                    plannerd
+                         │
+                         ▼
+                    [車両制御]
+                         │
+                    controlsd
+                         │
+                         ▼
+                   [CAN出力]
+                         │
+                    pandad → 車両
+```
+
+### 5.3 データフロー例（制御ループ）
+
+```
+1. pandad: CAN読み取り → carState配信
+2. modeld: カメラ画像処理 → modelV2配信
+3. plannerd: modelV2 + carState → lateralPlan, longitudinalPlan配信
+4. controlsd: *Plan + carState → controlsState, carControl配信
+5. pandad: carControl受信 → CANコマンド送信
+```
+
+各ステップは約20Hz（50ms周期）で実行されます。
+
+## 6. 重要なファイル・ディレクトリ
+
+### 6.1 コア実行環境
+
+| パス | 説明 |
+|------|------|
+| `launch_openpilot.sh` | エントリーポイント |
+| `launch_chffrplus.sh` | メイン起動スクリプト |
+| `system/manager/manager.py` | マネージャーメイン |
+| `system/manager/process.py` | プロセスクラス実装 |
+| `system/manager/process_config.py` | プロセス定義 |
+
+### 6.2 プロセス間通信
+
+| パス | 説明 |
+|------|------|
+| `msgq/` | メッセージキュー実装 |
+| `cereal/` | メッセージ定義（Cap'n Proto） |
+| `cereal/messaging/` | Pythonバインディング |
+
+### 6.3 主要制御ロジック
+
+| パス | 説明 |
+|------|------|
+| `selfdrive/controls/controlsd.py` | 車両制御メイン |
+| `selfdrive/controls/plannerd.py` | 経路計画 |
+| `selfdrive/controls/radard.py` | レーダー処理 |
+| `selfdrive/modeld/modeld.py` | AIモデル実行 |
+| `selfdrive/car/` | 車両インターフェース |
+
+### 6.4 設定・ユーティリティ
+
+| パス | 説明 |
+|------|------|
+| `common/params.py` | 設定管理システム |
+| `common/params.cc` | Params C++実装 |
+| `system/hardware/` | ハードウェア抽象化 |
+| `system/athena/` | クラウド通信 |
+
+## 7. 開発時のヒント
+
+### 7.1 プロセスのデバッグ
+
+特定のプロセスを無効化：
+```bash
+export BLOCK="modeld,plannerd"
+./launch_openpilot.sh
+```
+
+Pandaなしで起動（シミュレーション）：
+```bash
+export NOBOARD=1
+./launch_openpilot.sh
+```
+
+### 7.2 ログの確認
+
+```bash
+# マネージャーのログ
+tail -f /tmp/launch_log
+
+# 個別プロセスのログ（cloudlog経由）
+# /data/community/crashes/ や /tmp/ に出力
+```
+
+### 7.3 プロセスの追加
+
+1. `system/manager/process_config.py`に追加：
+```python
+PythonProcess("myprocess", "mymodule.myprocess", only_onroad),
+```
+
+2. モジュールを実装：
+```python
+# mymodule/myprocess.py
+import cereal.messaging as messaging
+
+def main():
+    pm = messaging.PubMaster(['myTopic'])
+    sm = messaging.SubMaster(['carState'])
+    while True:
+        sm.update()
+        # 処理
+        pm.send('myTopic', msg)
+```
+
+## 8. 車両制御の詳細データフロー
+
+### 8.0 よくある質問（Q&A）
+
+#### Q1: 縦制御はPIDとMPCのどちらを使っている？
+
+**A: 両方使っています（2段階構造）**
+
+縦制御は**MPC（上位層）**と**PID（下位層）**の2段階構造になっています：
+
+```
+┌─────────────────────────────────────────┐
+│ 上位層: MPC (plannerd)                  │
+│ - 役割: 最適な加速度軌道を計画          │
+│ - 入力: modelV2, radarState, v_cruise  │
+│ - 出力: aTarget（目標加速度）           │
+│ - 処理: 将来予測と最適化                │
+└──────────────┬──────────────────────────┘
+               │ aTarget
+               ▼
+┌─────────────────────────────────────────┐
+│ 下位層: PID (controlsd)                 │
+│ - 役割: aTargetに追従する制御入力を生成  │
+│ - 入力: aTarget, 実際の加速度 aEgo      │
+│ - 出力: accel（車両への指令）            │
+│ - 処理: 誤差をPID制御で補正              │
+└─────────────────────────────────────────┘
+```
+
+**なぜ2段階なのか？**
+- **MPC**: 将来を予測して「どう動くべきか」を計画（高レベル判断、快適性・安全性・燃費を最適化）
+- **PID**: 現在の状態から「どう制御すべきか」を実行（低レベル追従、実時間での誤差補正）
+- この役割分担により、計画（MPC）と実行（PID）を分離し、ロバスト性と最適性を両立
+
+**実装ファイル**:
+- MPC: `selfdrive/controls/lib/longitudinal_planner.py`
+- PID: `selfdrive/controls/lib/longcontrol.py`
+
+---
+
+#### Q2: 横制御はどういう制御をしている？
+
+**A: 曲率 → 横加速度 → トルク変換 → PID制御**
+
+横制御は以下の流れで動作します：
+
+```
+① 目標曲率(modelV2)
+      ↓ × vEgo²
+② 目標横加速度
+      ↓ torque_from_lateral_accel()
+③ 目標トルク
+      ↓
+   [PID制御]
+      ↓ 誤差補正
+④ 出力トルク
+      ↓
+   車両のEPSへ
+```
+
+**主な処理**:
+1. **曲率から横加速度へ変換**: `lateral_accel = curvature × velocity²`
+   - 物理の運動学の公式を使用
+   - 速度が速いほど、同じカーブでも横加速度が大きくなる
+
+2. **横加速度からトルクへ変換**: `torque = (lateral_accel × factor + offset) + friction`
+   - 車両ごとに異なるパラメータ（latAccelFactor, latAccelOffset）
+   - ステアリングの摩擦を考慮（friction）
+
+3. **PID制御で追従**: 目標トルクと実際のトルクの差をPIDで補正
+
+**3種類の制御方式**:
+- **Torque制御**: 最も一般的、物理モデルベース（上記の流れ）
+- **Angle制御**: TSS2車両、ステアリング角度を直接指定
+- **PID制御**: 旧世代車両、シンプルなPID制御
+
+**実装ファイル**:
+- `selfdrive/controls/lib/latcontrol_torque.py` (Torque制御)
+- `selfdrive/controls/lib/latcontrol_angle.py` (Angle制御)
+- `selfdrive/controls/lib/latcontrol_pid.py` (PID制御)
+
+---
+
+### 8.1 車両制御システムの全体像
+
+openpilotの車両制御は**縦制御（Longitudinal Control）**と**横制御（Lateral Control）**に分かれます。
+
+```
+[センサー入力] → [認識・推定] → [経路計画] → [車両制御] → [CAN出力]
+      ↓              ↓              ↓            ↓           ↓
+   card.py      modeld.py      plannerd.py  controlsd.py  carcontroller.py
+```
+
+#### 縦制御（Longitudinal Control）
+- **目的**: アクセル・ブレーキの制御
+- **2段階構造**:
+  - **上位層（MPC）**: 最適な加速度軌道を計画 → `aTarget`
+  - **下位層（PID）**: `aTarget`に追従する制御入力を生成 → `accel`
+- **制御対象**: 車速、車間距離、加減速の快適性
+
+#### 横制御（Lateral Control）
+- **目的**: ハンドル操作の制御
+- **制御方式**: 曲率 → 横加速度 → トルク/角度 → PID制御
+- **出力**: ステアリングトルク or ステアリング角度
+- **制御対象**: 車線維持、カーブ走行、目標曲率への追従
+
+### 8.2 データフローの詳細
+
+#### フェーズ1: センサー入力とCarState生成
+
+**プロセス**: `card.py` (selfdrive/car/)
+
+```python
+# card.py の主要処理
+class Car:
+    def state_update(self):
+        # 1. CANメッセージ受信
+        can_strs = messaging.drain_sock_raw(self.can_sock, wait_for_one=True)
+        can_list = can_capnp_to_list(can_strs)
+
+        # 2. CarStateの更新
+        CS = self.CI.update(can_list)  # CarInterface経由でCAN解析
+
+        # 3. RadarDataの更新
+        RD = self.RI.update(can_list)
+
+        return CS, RD
+```
+
+**CarState (CS) の主要データ**:
+```python
+CS.vEgo           # 自車速度 (m/s)
+CS.aEgo           # 自車加速度 (m/s^2)
+CS.steeringAngleDeg  # ステアリング角度 (度)
+CS.steeringTorque    # ドライバーのステアリングトルク
+CS.steeringPressed   # ドライバーがハンドルを握っているか
+CS.brakePressed      # ブレーキペダル
+CS.gasPressed        # アクセルペダル
+CS.cruiseState       # クルーズコントロール状態
+CS.standstill        # 停車中か
+```
+
+**データの流れ**:
+```
+[車両CAN] → pandad → can socket → card.py
+                                     ↓
+                              CarInterface.update()
+                                     ↓
+                                  carState ── publish → msgq
+```
+
+#### フェーズ2: AI認識とモデル推論（★機械学習モデル）
+
+**プロセス**: `modeld.py` (selfdrive/modeld/)
+
+**【重要】openpilotは2つのニューラルネットワークモデルを使用**
+
+openpilotは**Vision Model**と**Policy Model**の2段階の深層学習モデルで制御指令を生成します：
+
+```
+カメラ画像（8枚の履歴）
+        ↓
+┌──────────────────────────────────────────────┐
+│ Vision Model (driving_vision_tinygrad.pkl)   │
+│ - 入力: カメラ画像（現在 + 過去7フレーム）      │
+│ - 処理: 画像特徴抽出 + 環境認識               │
+│ - 出力:                                      │
+│   • hidden_state (512次元の特徴ベクトル)     │
+│   • 車線位置・曲率                           │
+│   • 道路エッジ                               │
+│   • ポーズ推定                               │
+│   • desire予測（車線変更意図）               │
+└──────────────┬───────────────────────────────┘
+               │ hidden_state + desire
+               ▼
+┌──────────────────────────────────────────────┐
+│ Policy Model (driving_policy_tinygrad.pkl)   │
+│ - 入力:                                      │
+│   • Vision Modelの特徴 (hidden_state)        │
+│   • desire（運転意図）                        │
+│   • 過去の制御履歴 (prev_desired_curv)       │
+│   • 横制御パラメータ (lateral_control_params)│
+│ - 処理: 制御戦略の決定                        │
+│ - 出力:                                      │
+│   • desired_curvature（目標曲率）← 横制御用  │
+│   • plan（速度・加速度プロファイル）← 縦制御用│
+└──────────────────────────────────────────────┘
+```
+
+**Vision Modelの役割（認識層）**:
+- **入力**: カメラ画像（128x256, 320x160の2サイズ） × 8フレーム履歴
+- **処理**: CNNベースの特徴抽出
+- **出力**:
+  - `hidden_state`: 512次元の抽象化された環境特徴
+  - `lane_lines`: 車線位置（4本、左右各2本）
+  - `road_edges`: 道路エッジ（2本）
+  - `pose`: 車両姿勢推定
+  - `desire_pred`: 将来の運転意図予測
+
+**Policy Modelの役割（制御層）**:
+- **入力**:
+  - Vision Modelの特徴ベクトル
+  - `desire`: 運転意図（8次元: 直進、左車線変更、右車線変更など）
+  - `prev_desired_curv`: 過去の制御履歴
+  - `traffic_convention`: 交通規則（右側通行/左側通行）
+  - `lateral_control_params`: 横制御パラメータ
+- **処理**: 時系列データを考慮した制御戦略の決定（LSTMやTransformerベース）
+- **出力**:
+  - `desired_curvature`: **目標曲率（横制御の入力）**
+  - `plan`: 速度・加速度・位置の軌道（33ポイント、10秒先まで）
+  - `lane_lines`: 詳細な車線位置
+  - `road_edges`: 道路境界
+
+**機械学習モデルの実装詳細**:
+
+```python
+# modeld.py の主要処理
+class ModelState:
+    def run(self, buf, wbuf, transform, transform_wide, inputs, prepare_only):
+        # 1. Vision Model実行（画像→特徴抽出）
+        self.vision_output = self.vision_run(**self.vision_inputs).numpy().flatten()
+        vision_outputs = self.parser.parse_vision_outputs(
+            self.slice_outputs(self.vision_output, self.vision_output_slices)
+        )
+
+        # 2. 特徴をバッファに保存（時系列処理用）
+        self.full_features_buffer[0,-1] = vision_outputs['hidden_state'][0, :]
+        self.numpy_inputs['features_buffer'][:] = self.full_features_buffer[0, self.temporal_idxs]
+
+        # 3. Policy Model実行（特徴→制御指令）
+        self.policy_output = self.policy_run(**self.policy_inputs).numpy().flatten()
+        policy_outputs = self.parser.parse_policy_outputs(
+            self.slice_outputs(self.policy_output, self.policy_output_slices)
+        )
+
+        # 4. desired_curvature（横制御用）を抽出
+        # これが controlsd の横制御に渡される
+        return {**vision_outputs, **policy_outputs}
+
+def get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego):
+    # Policy Modelの出力から制御指令を取得
+
+    # 横制御用: desired_curvature
+    desired_curvature = model_output['desired_curvature'][0, 0]
+    if v_ego > MIN_LAT_CONTROL_SPEED:
+        desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature,
+                                        LAT_SMOOTH_SECONDS)
+
+    # 縦制御用: desired_accel（planから計算）
+    plan = model_output['plan'][0]
+    desired_accel, should_stop = get_accel_from_plan(
+        plan[:,Plan.VELOCITY][:,0],
+        plan[:,Plan.ACCELERATION][:,0],
+        ModelConstants.T_IDXS,
+        action_t=long_action_t
+    )
+
+    return log.ModelDataV2.Action(
+        desiredCurvature=float(desired_curvature),  # ← 横制御で使用
+        desiredAcceleration=float(desired_accel),   # ← 縦制御で使用
+        shouldStop=bool(should_stop)
+    )
+```
+
+**modelV2の主要データ（msgqで配信）**:
+```python
+# 横制御に使用
+modelV2.action.desiredCurvature  # 目標曲率（Policy Modelの出力）
+
+# 縦制御に使用（plannerdで使用）
+modelV2.position.x[]      # 予測位置（時系列、33ポイント）
+modelV2.velocity.x[]      # 予測速度（時系列、33ポイント）
+modelV2.acceleration.x[]  # 予測加速度（時系列、33ポイント）
+
+# 車線情報
+modelV2.laneLines[]       # 車線位置（4本）
+modelV2.roadEdges[]       # 道路エッジ（2本）
+
+# メタ情報
+modelV2.meta.laneChangeState     # 車線変更状態
+modelV2.meta.engagedProb         # 運転継続確率
+```
+
+**モデルファイル**:
+- Vision Model: `selfdrive/modeld/models/driving_vision_tinygrad.pkl`
+- Policy Model: `selfdrive/modeld/models/driving_policy_tinygrad.pkl`
+- メタデータ: `driving_vision_metadata.pkl`, `driving_policy_metadata.pkl`
+
+**推論フレームワーク**:
+- **tinygrad**: comma.aiが開発した軽量な深層学習フレームワーク
+- GPU/NPU上で効率的に実行
+- Jetson Nanoへの移植時は、TensorRTへの変換が必要
+
+**重要なポイント**:
+- **横制御の目標曲率は完全にAIが決定**している
+- 従来の制御理論（PID）はAIの出力に追従するだけ
+- Vision ModelとPolicy Modelの分離により、認識と制御を独立に学習・改善可能
+
+---
+
+### 8.2.1 横制御モデルの入力と出力の詳細リスト
+
+#### Vision Model（認識層）の入力と出力
+
+**【Vision Model 入力】**
+
+| 入力名 | 型・サイズ | 説明 | 備考 |
+|--------|----------|------|------|
+| `input_imgs` | uint8[1, 12, 128, 256] | 通常カメラ画像 | 12枚 = 現在 + 過去11フレーム（ただし4フレームごとにサンプリング = 実質3フレーム分） |
+| `big_input_imgs` | uint8[1, 12, 128, 256] | 広角カメラ画像 | 12枚 = 現在 + 過去11フレーム（ただし4フレームごとにサンプリング = 実質3フレーム分） |
+
+**画像の詳細**:
+- **入力画像枚数**: 現在フレーム + 過去7フレーム履歴 = 合計8フレーム
+- **時間間隔**: `TEMPORAL_SKIP = 4`（MODEL_FREQ 20Hz / HISTORY_FREQ 5Hz）
+  - つまり 0.05秒 × 4 = 0.2秒間隔でサンプリング
+  - 8フレーム × 0.2秒 = 1.6秒分の履歴
+- **画像サイズ**:
+  - 通常カメラ: 128×256ピクセル
+  - 広角カメラ: 128×256ピクセル（より広い視野角）
+- **前処理**: カメラ画像に変換行列（transform）を適用して正規化
+
+**【Vision Model 出力】**
+
+| 出力名 | 型・サイズ | 説明 | 用途 |
+|--------|----------|------|------|
+| `hidden_state` | float32[1, 512] | 画像特徴ベクトル | **Policy Modelへの入力として使用** |
+| `pose` | float32[1, 6] | 車両姿勢推定 | ロール、ピッチ、ヨー + その速度 |
+| `wide_from_device_euler` | float32[1, 3] | 広角カメラの姿勢 | カメラキャリブレーション用 |
+| `road_transform` | float32[1, 6] | 道路変換パラメータ | 道路座標系への変換 |
+| `lane_lines` | float32[1, 4, 33, 2] | 車線位置 | 4本の車線、33時間ポイント、(x, y) |
+| `lane_lines_stds` | float32[1, 4, 33, 2] | 車線位置の標準偏差 | 不確実性の推定 |
+| `road_edges` | float32[1, 2, 33, 2] | 道路エッジ | 2本（左右）、33時間ポイント |
+| `road_edges_stds` | float32[1, 2, 33, 2] | 道路エッジの標準偏差 | 不確実性の推定 |
+| `desire_pred` | float32[1, 4, 8] | 運転意図の予測 | 4時間ステップ、8種類のdesire |
+| `meta` | float32[1, varies] | メタ情報 | engaged確率、disengage予測など |
+
+**hidden_stateの重要性**:
+- 512次元の高次元特徴ベクトル
+- カメラ画像から抽出された「環境の要約」
+- Policy Modelがこれを基に制御判断を行う
+- CNNの中間層の出力に相当
+
+---
+
+#### Policy Model（制御層）の入力と出力
+
+**【Policy Model 入力】**
+
+| 入力名 | 型・サイズ | 説明 | 取得元 |
+|--------|----------|------|--------|
+| `features_buffer` | float32[1, 25, 512] | Vision Modelの特徴履歴 | Vision Modelの`hidden_state`を時系列バッファ |
+| `desire` | float32[1, 25, 8] | 運転意図（時系列） | ユーザー入力 + 自動判断 |
+| `traffic_convention` | float32[1, 2] | 交通規則 | [右側通行, 左側通行] のone-hot |
+| `lateral_control_params` | float32[1, 2] | 横制御パラメータ | [steer_ratio, stiffness_factor] |
+| `prev_desired_curv` | float32[1, 25, 1] | 過去の目標曲率 | 前回のモデル出力をフィードバック |
+
+**入力の詳細説明**:
+
+1. **features_buffer**: `(1, 25, 512)`
+   - 25フレーム = 5秒分の履歴（5Hz × 5秒）
+   - 各フレームに512次元の特徴ベクトル
+   - Vision Modelから順次蓄積される
+
+2. **desire**: `(1, 25, 8)`
+   - 8次元ベクトルの意味（推定）:
+     ```
+     [0] none（何もしない）
+     [1] turnLeft（左折）
+     [2] turnRight（右折）
+     [3] laneChangeLeft（左車線変更）
+     [4] laneChangeRight（右車線変更）
+     [5] keepLane（車線維持）
+     [6] ...（その他の運転意図）
+     ```
+   - パルス信号として入力（立ち上がりエッジで検出）
+   - モデルが自動で完了を判断
+
+3. **traffic_convention**: `(1, 2)`
+   - `[1, 0]`: 右側通行（日本、アメリカ等）
+   - `[0, 1]`: 左側通行（イギリス等）
+
+4. **lateral_control_params**: `(1, 2)`
+   - `[0]`: steer_ratio（ステアリングギア比）
+   - `[1]`: stiffness_factor（タイヤ剛性係数）
+   - 車両固有のパラメータをモデルに入力
+
+5. **prev_desired_curv**: `(1, 25, 1)`
+   - 過去25フレーム分の目標曲率
+   - フィードバック制御のため
+   - 急激な変化を抑制
+
+**【Policy Model 出力】**
+
+| 出力名 | 型・サイズ | 説明 | 用途 |
+|--------|----------|------|------|
+| **`desired_curvature`** | **float32[1, 1]** | **目標曲率** | **★横制御の入力として使用★** |
+| `plan` | float32[1, 33, 15] | 軌道計画 | 縦制御（MPC）の入力 |
+| `plan_stds` | float32[1, 33, 15] | 軌道計画の標準偏差 | 不確実性 |
+| `lane_lines` | float32[1, 4, 33, 2] | 車線位置（詳細版） | Vision出力の改良版 |
+| `lane_lines_stds` | float32[1, 4, 33, 2] | 車線位置の標準偏差 | 不確実性 |
+| `road_edges` | float32[1, 2, 33, 2] | 道路エッジ（詳細版） | Vision出力の改良版 |
+| `road_edges_stds` | float32[1, 2, 33, 2] | 道路エッジの標準偏差 | 不確実性 |
+| `sim_pose` | float32[1, 6] | シミュレーション姿勢 | デバッグ用 |
+
+**最重要出力: desired_curvature**:
+- **型**: スカラー値（1個の浮動小数点数）
+- **単位**: 1/m（曲率）
+- **意味**: この曲率で曲がるべきという指令
+- **範囲**: 典型的には -0.1 ～ 0.1（曲率半径 10m ～ ∞）
+- **使用箇所**: `controlsd.py` → `LatControl` → 横制御PID
+- **処理フロー**:
+  ```
+  desired_curvature → desired_lateral_accel → desired_torque → PID → output_torque → CAN
+  ```
+
+**plan出力の詳細**: `(1, 33, 15)`
+- 33ポイント: 10秒先までの予測（T_IDXS）
+- 15次元の内訳（Plan クラス定義より）:
+  ```python
+  [0:3]   POSITION (x, y, z)         # 位置
+  [3:6]   VELOCITY (vx, vy, vz)      # 速度
+  [6:9]   ACCELERATION (ax, ay, az)  # 加速度
+  [9:12]  T_FROM_CURRENT_EULER       # 姿勢角度
+  [12:15] ORIENTATION_RATE           # 姿勢角速度
+  ```
+- 縦制御のMPCがこのplanを使用
+
+---
+
+#### データフロー図（横制御に焦点）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Vision Model                             │
+│  入力: カメラ画像（8フレーム履歴）                            │
+│  出力: hidden_state[512] ← これが重要                        │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ hidden_state を時系列バッファに蓄積
+                       ▼
+        ┌──────────────────────────────┐
+        │  features_buffer[25, 512]    │
+        │  （5秒分の特徴履歴）          │
+        └──────────────┬───────────────┘
+                       │
+        ┌──────────────┴───────────────────────────────────────┐
+        │             他の入力と結合                            │
+        │  • desire[25, 8]                                    │
+        │  • traffic_convention[2]                            │
+        │  • lateral_control_params[2]                        │
+        │  • prev_desired_curv[25, 1]                         │
+        └──────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Policy Model                             │
+│  処理: LSTMまたはTransformerで時系列処理                      │
+│  出力: desired_curvature[1] ← ★これが横制御の目標★            │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       │ desired_curvature (例: 0.05 = 半径20m)
+                       ▼
+              ┌────────────────┐
+              │  controlsd.py  │
+              │   LatControl   │
+              └────────┬───────┘
+                       │
+          desired_curvature × vEgo² = desired_lateral_accel
+                       │
+                       ▼
+          torque_from_lateral_accel() でトルク変換
+                       │
+                       ▼
+                  PID制御で追従
+                       │
+                       ▼
+                  output_torque
+                       │
+                       ▼
+              車両のEPS（ステアリング）
+```
+
+---
+
+#### モデル推論の実行頻度
+
+```
+カメラ: 20Hz（50msごと）
+   ↓
+Vision Model実行: 20Hz
+   ↓
+hidden_stateをバッファに蓄積: 20Hz
+   ↓
+Policy Model実行: 20Hz
+   ↓
+desired_curvature出力: 20Hz
+   ↓
+controlsd（横制御PID）: 100Hz
+   └→ モデル出力（20Hz）を100Hzで補間して使用
+```
+
+**なぜ100Hz制御なのに20Hzのモデル出力で十分か？**
+- モデルは「どの方向に曲がるべきか」という高レベル判断
+- PID制御が「どうやって曲がるか」という低レベル実行
+- 人間の運転でも0.05秒（20Hz）ごとに判断を更新すれば十分
+- PIDが100Hzで細かく追従するため滑らか
+
+---
+
+#### Jetson Nano移植時の注意点
+
+**モデル入力の準備**:
+1. カメラ画像を8フレーム分バッファリング
+2. 画像を128×256にリサイズ
+3. 変換行列（transform）で正規化
+4. Vision Modelに入力
+
+**モデル推論**:
+1. Vision Model実行 → hidden_state取得
+2. hidden_stateを25フレーム分のバッファに保存
+3. その他の入力（desire等）を準備
+4. Policy Model実行 → desired_curvature取得
+
+**モデルの変換**:
+- tinygrad → ONNX → TensorRT が推奨
+- または tinygrad → PyTorch → TensorRT
+- Jetson NanoのGPUで効率的に動作させる
+
+**必要なメモリ**:
+- Vision Model入力: 約1.5MB（画像バッファ）
+- Policy Model入力: 約0.5MB（特徴バッファ）
+- モデルパラメータ: 数十MB～数百MB
+- 推論時の作業メモリ: 数百MB
+
+**リアルタイム性**:
+- Vision Model: ~10ms以内
+- Policy Model: ~5ms以内
+- 合計: 20Hz（50ms周期）で動作必須
+
+---
+
+### 8.2.2 画像取得から制御までの完全な処理フロー
+
+このセクションでは、カメラで画像を取得してから、2つのMLモデル（Vision Model と Policy Model）を経て、最終的に横制御・縦制御にデータが渡されるまでの**完全な処理フロー**を詳細に説明します。
+
+#### ステップ1: カメラ画像の取得（camerad → modeld）
+
+**プロセス**: `camerad` → VisionIPC → `modeld`
+
+```python
+# modeld.py の main() 関数
+def main():
+    # 1-1. VisionIPCクライアントの初期化
+    vipc_client_main = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_ROAD, True, cl_context)
+    vipc_client_extra = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, False, cl_context)
+
+    # 1-2. cameradとの接続確立
+    while not vipc_client_main.connect(False):
+        time.sleep(0.1)
+
+    # メインループ開始
+    while True:
+        # 1-3. カメラフレーム受信（ブロッキング）
+        buf_main = vipc_client_main.recv()  # 通常カメラ画像
+        buf_extra = vipc_client_extra.recv()  # 広角カメラ画像
+
+        # フレーム同期チェック（タイムスタンプの差が10ms以内か確認）
+        if abs(meta_main.timestamp_sof - meta_extra.timestamp_sof) > 10000000:
+            cloudlog.error("frames out of sync!")
+```
+
+**画像データの形式**:
+- `buf_main`: VisionBuf型（共有メモリ上の画像バッファへのポインタ）
+- 画像サイズ: カメラ解像度（例: 1928×1208）
+- フォーマット: YUV420（生データ）
+- フレームレート: 20Hz（50msごと）
+
+**VisionIPCの仕組み**:
+```
+┌──────────┐   共有メモリ   ┌──────────┐
+│ camerad  │◄──(/dev/shm)──►│ modeld   │
+└──────────┘                └──────────┘
+    │                            ▲
+    └─ フレーム準備完了を通知 ──┘
+```
+
+---
+
+#### ステップ2: 画像の前処理と変換
+
+**プロセス**: `modeld.py` → `ModelState.run()`
+
+```python
+# modeld.py のメインループ続き
+def main():
+    # 2-1. carStateなどのデータ取得
+    sm.update(0)  # SubMasterでメッセージ更新
+    v_ego = max(sm["carState"].vEgo, 0.)  # 自車速度
+    is_rhd = sm["driverMonitoringState"].isRHD  # 右ハンドルか
+
+    # 2-2. キャリブレーションデータから変換行列を計算
+    device_from_calib_euler = np.array(sm["liveCalibration"].rpyCalib)
+    model_transform_main = get_warp_matrix(device_from_calib_euler, intrinsics, False)
+    model_transform_extra = get_warp_matrix(device_from_calib_euler, intrinsics, True)
+
+    # 2-3. desireベクトルの準備（運転意図）
+    vec_desire = np.zeros(8, dtype=np.float32)
+    vec_desire[desire] = 1  # one-hotエンコーディング
+
+    # 2-4. 横制御パラメータの準備
+    lat_delay = sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    lateral_control_params = np.array([v_ego, lat_delay], dtype=np.float32)
+
+    # 2-5. 交通規則（右側通行/左側通行）
+    traffic_convention = np.zeros(2)
+    traffic_convention[int(is_rhd)] = 1
+
+    # 2-6. モデルへの入力をまとめる
+    inputs = {
+        'desire': vec_desire,
+        'traffic_convention': traffic_convention,
+        'lateral_control_params': lateral_control_params,
+    }
+
+    # 2-7. モデル実行
+    model_output = model.run(
+        buf_main, buf_extra,           # カメラ画像バッファ
+        model_transform_main,          # 変換行列
+        model_transform_extra,         # 変換行列（広角）
+        inputs,                        # その他の入力
+        prepare_only=False
+    )
+```
+
+**変換行列（transform）の役割**:
+- カメラキャリブレーションを反映
+- デバイスの傾き（ロール、ピッチ、ヨー）を補正
+- 画像を「道路座標系」に変換
+- モデル入力サイズ（128×256）にリサイズ
+
+---
+
+#### ステップ3: Vision Model実行（画像 → 特徴抽出）
+
+**プロセス**: `ModelState.run()` 内部
+
+```python
+# modeld.py の ModelState.run()
+class ModelState:
+    def run(self, buf, wbuf, transform, transform_wide, inputs, prepare_only):
+        # 3-1. 画像の準備（OpenCL/GPU上で実行）
+        imgs_cl = {
+            'input_imgs': self.frames['input_imgs'].prepare(buf, transform.flatten()),
+            'big_input_imgs': self.frames['big_input_imgs'].prepare(wbuf, transform_wide.flatten())
+        }
+
+        # DrivingModelFrame.prepare() の処理:
+        #   - カメラ画像をリングバッファに追加（8フレーム履歴を保持）
+        #   - YUV420 → RGB変換
+        #   - リサイズ（128×256 または 320×160）
+        #   - 正規化（0-255 → 0.0-1.0）
+        #   - GPU/OpenCLメモリ上で処理
+
+        # 3-2. Vision Modelへの入力準備
+        for key in imgs_cl:
+            self.vision_inputs[key] = Tensor(frame_input, dtype=dtypes.uint8).realize()
+
+        # vision_inputs の構造:
+        # {
+        #   'input_imgs': Tensor[1, 12, 128, 256],      # 通常カメラ
+        #   'big_input_imgs': Tensor[1, 12, 128, 256]   # 広角カメラ
+        # }
+        # ※ 12 = TEMPORAL_SKIP (4) × 履歴3フレーム分のパディング
+
+        # 3-3. Vision Model推論実行
+        self.vision_output = self.vision_run(**self.vision_inputs).numpy().flatten()
+
+        # vision_run() の内部:
+        #   - tinygradで定義されたCNN実行
+        #   - ResNetまたはEfficientNetベースのバックボーン
+        #   - 複数の出力ヘッド（hidden_state, lane_lines, pose等）
+        #   - GPU/NPU上で並列実行
+        #   - 実行時間: 約10ms
+
+        # 3-4. Vision Model出力のパース
+        vision_outputs = self.parser.parse_vision_outputs(
+            self.slice_outputs(self.vision_output, self.vision_output_slices)
+        )
+
+        # vision_outputs の構造:
+        # {
+        #   'hidden_state': array[1, 512],           ← ★重要: Policy Modelへの入力
+        #   'pose': array[1, 6],
+        #   'wide_from_device_euler': array[1, 3],
+        #   'road_transform': array[1, 6],
+        #   'lane_lines': array[1, 4, 33, 2],
+        #   'road_edges': array[1, 2, 33, 2],
+        #   'desire_pred': array[1, 4, 8],
+        #   'meta': array[1, ...],
+        #   ...
+        # }
+```
+
+**Vision Modelの処理内容**:
+```
+入力画像[1, 12, 128, 256]
+    ↓
+[Conv層] → [BN] → [ReLU]  ← 特徴抽出開始
+    ↓
+[ResNetブロック] × N       ← 深い畳み込み
+    ↓
+[Feature Map: 512ch]       ← 抽象的な特徴
+    ↓
+┌──────────┴──────────┐
+│                     │
+▼                     ▼
+[Global Pool]     [Conv Head]
+    ↓                 ↓
+hidden_state[512]  lane_lines, pose, etc.
+```
+
+---
+
+#### ステップ4: 特徴バッファの管理（時系列データ化）
+
+```python
+# modeld.py の ModelState.run() 続き
+    def run(self, ...):
+        # 4-1. hidden_stateを時系列バッファに追加
+        self.full_features_buffer[0, :-1] = self.full_features_buffer[0, 1:]  # 左シフト
+        self.full_features_buffer[0, -1] = vision_outputs['hidden_state'][0, :]  # 最新を追加
+
+        # full_features_buffer の構造:
+        # shape: [1, 100, 512]
+        # 100フレーム = 5秒分（20Hz × 5秒）
+        # 各フレームに512次元の特徴ベクトル
+
+        # 4-2. Policy Model用に時間的にサンプリング（5Hz → 25フレーム分）
+        self.numpy_inputs['features_buffer'][:] = self.full_features_buffer[0, self.temporal_idxs]
+
+        # temporal_idxs = slice(-1-(4*(25-1)), None, 4)
+        # つまり、4フレームごと（0.2秒間隔）に25フレーム = 5秒分を取得
+
+        # 4-3. desireバッファも同様に管理
+        self.full_desire[0, :-1] = self.full_desire[0, 1:]
+        self.full_desire[0, -1] = new_desire
+        self.numpy_inputs['desire'][:] = self.full_desire[0, self.temporal_idxs]
+
+        # 4-4. 前回の制御出力もバッファに追加
+        self.full_prev_desired_curv[0, :-1] = self.full_prev_desired_curv[0, 1:]
+        self.full_prev_desired_curv[0, -1, :] = policy_outputs_dict['desired_curvature'][0, :]
+        self.numpy_inputs['prev_desired_curv'][:] = self.full_prev_desired_curv[0, self.temporal_idxs]
+```
+
+**バッファ管理の可視化**:
+```
+時刻 t=0    t=1    t=2    t=3    t=4    t=5 (現在)
+     ↓      ↓      ↓      ↓      ↓      ↓
+    [h0]   [h1]   [h2]   [h3]   [h4]   [h5]  ← hidden_state
+     │      │      │      │      │      │
+     └──────┴──────┴──────┴──────┴──────┘
+                  ↓
+    [h0,  _, _, _, h1,  _, _, _, h2, ...]  ← 4フレームごとにサンプリング
+                  ↓
+         Policy Modelへ入力 [25, 512]
+```
+
+---
+
+#### ステップ5: Policy Model実行（特徴 → 制御指令）
+
+```python
+# modeld.py の ModelState.run() 続き
+    def run(self, ...):
+        # 5-1. Policy Modelへの入力を更新
+        self.numpy_inputs['traffic_convention'][:] = inputs['traffic_convention']
+        self.numpy_inputs['lateral_control_params'][:] = inputs['lateral_control_params']
+
+        # policy_inputs の最終的な構造:
+        # {
+        #   'features_buffer': array[1, 25, 512],        ← Vision特徴（時系列）
+        #   'desire': array[1, 25, 8],                   ← 運転意図（時系列）
+        #   'traffic_convention': array[1, 2],           ← 交通規則
+        #   'lateral_control_params': array[1, 2],       ← [v_ego, lat_delay]
+        #   'prev_desired_curv': array[1, 25, 1],        ← 過去の制御出力（時系列）
+        # }
+
+        # 5-2. Policy Model推論実行
+        self.policy_output = self.policy_run(**self.policy_inputs).numpy().flatten()
+
+        # policy_run() の内部:
+        #   - LSTM/Transformer層で時系列処理
+        #   - Attention機構で重要な特徴に注目
+        #   - 複数の出力ヘッド（desired_curvature, plan等）
+        #   - GPU/NPU上で並列実行
+        #   - 実行時間: 約5ms
+
+        # 5-3. Policy Model出力のパース
+        policy_outputs = self.parser.parse_policy_outputs(
+            self.slice_outputs(self.policy_output, self.policy_output_slices)
+        )
+
+        # policy_outputs の構造:
+        # {
+        #   'desired_curvature': array[1, 1],         ← ★横制御の目標値
+        #   'plan': array[1, 33, 15],                 ← 縦制御用の軌道
+        #   'plan_stds': array[1, 33, 15],            ← 不確実性
+        #   'lane_lines': array[1, 4, 33, 2],         ← 詳細化された車線
+        #   'road_edges': array[1, 2, 33, 2],
+        #   'sim_pose': array[1, 6],
+        #   ...
+        # }
+
+        # 5-4. Vision出力とPolicy出力を統合
+        combined_outputs = {**vision_outputs, **policy_outputs}
+        return combined_outputs
+```
+
+**Policy Modelの処理内容**:
+```
+features_buffer[25, 512] + desire[25, 8] + その他
+                ↓
+[Embedding層] → 各入力を埋め込み表現に変換
+                ↓
+[LSTM/Transformer層] × N  ← 時系列の文脈を理解
+                ↓
+[Attention機構]  ← 重要な時間ステップに注目
+                ↓
+        ┌───────┴───────┐
+        │               │
+        ▼               ▼
+[Curvature Head]  [Plan Head]
+        │               │
+        ▼               ▼
+desired_curvature[1]  plan[33, 15]
+```
+
+---
+
+#### ステップ6: モデル出力からアクションへの変換
+
+```python
+# modeld.py の main() メインループ続き
+def main():
+    # 6-1. モデル実行結果を取得
+    model_output = model.run(buf_main, buf_extra, transform_main, transform_extra, inputs, False)
+
+    # 6-2. アクションの抽出
+    new_action = get_action_from_model(
+        model_output,
+        prev_action,
+        lat_action_t=lat_delay,    # 横制御の遅延時間
+        long_action_t=0.0,         # 縦制御の遅延時間
+        v_ego=v_ego
+    )
+
+    # get_action_from_model() の詳細:
+    def get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego):
+        # 6-2-1. 横制御用: desired_curvature
+        desired_curvature = model_output['desired_curvature'][0, 0]
+
+        # スムージング処理（急激な変化を抑制）
+        if v_ego > MIN_LAT_CONTROL_SPEED:  # 0.3 m/s以上の場合
+            desired_curvature = smooth_value(
+                desired_curvature,
+                prev_action.desiredCurvature,
+                LAT_SMOOTH_SECONDS  # 0.0秒（現在は無効）
+            )
+        else:
+            # 低速時は前回の値を維持
+            desired_curvature = prev_action.desiredCurvature
+
+        # 6-2-2. 縦制御用: planから加速度を抽出
+        plan = model_output['plan'][0]  # shape: [33, 15]
+
+        # Plan構造の抽出:
+        # plan[:, 0:3]   = POSITION (x, y, z)
+        # plan[:, 3:6]   = VELOCITY (vx, vy, vz)
+        # plan[:, 6:9]   = ACCELERATION (ax, ay, az)
+        # plan[:, 9:12]  = T_FROM_CURRENT_EULER
+        # plan[:, 12:15] = ORIENTATION_RATE
+
+        velocity = plan[:, Plan.VELOCITY][:, 0]      # x方向の速度 [33]
+        acceleration = plan[:, Plan.ACCELERATION][:, 0]  # x方向の加速度 [33]
+
+        # 目標加速度の計算
+        desired_accel, should_stop = get_accel_from_plan(
+            velocity,
+            acceleration,
+            ModelConstants.T_IDXS,  # 時間インデックス
+            action_t=long_action_t   # 遅延補償
+        )
+
+        # スムージング
+        desired_accel = smooth_value(
+            desired_accel,
+            prev_action.desiredAcceleration,
+            LONG_SMOOTH_SECONDS  # 0.0秒（現在は無効）
+        )
+
+        # 6-2-3. Actionメッセージの作成
+        return log.ModelDataV2.Action(
+            desiredCurvature=float(desired_curvature),      # ← 横制御へ
+            desiredAcceleration=float(desired_accel),       # ← 縦制御へ（plannerd経由）
+            shouldStop=bool(should_stop)
+        )
+```
+
+---
+
+#### ステップ7: modelV2メッセージの配信
+
+```python
+# modeld.py の main() メインループ続き
+def main():
+    # 7-1. modelV2メッセージの作成
+    modelv2_send = messaging.new_message('modelV2')
+
+    # 7-2. モデル出力をメッセージに詰める
+    fill_model_msg(
+        modelv2_send.modelV2,
+        model_output,
+        publish_state,
+        meta_main.frame_id,
+        meta_main.timestamp_eof,
+        meta_extra.timestamp_eof,
+        frame_drop_ratio,
+        new_action,           # ← desired_curvature と desired_accel を含む
+        v_ego
+    )
+
+    # fill_model_msg() の主な処理:
+    #   - modelV2.action.desiredCurvature = new_action.desiredCurvature
+    #   - modelV2.action.desiredAcceleration = new_action.desiredAcceleration
+    #   - modelV2.position.x = model_output['plan'][0, :, Plan.POSITION][:, 0]
+    #   - modelV2.velocity.x = model_output['plan'][0, :, Plan.VELOCITY][:, 0]
+    #   - modelV2.acceleration.x = model_output['plan'][0, :, Plan.ACCELERATION][:, 0]
+    #   - modelV2.laneLines = model_output['lane_lines']
+    #   - modelV2.roadEdges = model_output['road_edges']
+    #   - その他多数の情報
+
+    # 7-3. msgqで配信
+    pm.send('modelV2', modelv2_send)
+
+    # 配信先:
+    #   - controlsd: action.desiredCurvature を使用（横制御）
+    #   - plannerd: position, velocity, acceleration を使用（縦制御のMPC）
+    #   - selfdrived: meta情報を使用（状態管理）
+    #   - ui: 表示用
+```
+
+**modelV2メッセージの構造**:
+```python
+modelV2 = {
+    'frameId': 12345,
+    'timestampEof': 1234567890,
+    'frameDropPerc': 0.0,
+
+    # ★横制御で使用
+    'action': {
+        'desiredCurvature': 0.05,        # 1/m（曲率）
+        'desiredAcceleration': 0.5,      # m/s²
+        'shouldStop': False
+    },
+
+    # 縦制御で使用（plannerd経由）
+    'position': {'x': [0, 2.5, 5.2, ...], 'y': [...], 'z': [...]},  # 33ポイント
+    'velocity': {'x': [10, 10.5, 11, ...], 'y': [...], 'z': [...]},
+    'acceleration': {'x': [0.5, 0.4, ...], 'y': [...], 'z': [...]},
+
+    # 車線情報
+    'laneLines': [...],          # 4本の車線
+    'laneLineProbs': [...],      # 確信度
+    'roadEdges': [...],          # 2本の道路エッジ
+
+    # メタ情報
+    'meta': {
+        'engagedProb': 0.95,
+        'disengagePredictions': {...},
+        'hardBrakePredicted': 0.01,
+    }
+}
+```
+
+---
+
+#### ステップ8: controlsdでの受信と横制御への受け渡し
+
+```python
+# controlsd.py の Controls クラス
+class Controls:
+    def __init__(self):
+        # 8-1. SubMasterで modelV2 を購読
+        self.sm = messaging.SubMaster([
+            'modelV2',           # ← モデル出力
+            'carState',
+            'longitudinalPlan',
+            # その他多数...
+        ], poll='selfdriveState')
+
+    def state_control(self):
+        # 8-2. 最新のメッセージを取得
+        self.sm.update(15)  # 15msタイムアウト
+
+        CS = self.sm['carState']
+        model_v2 = self.sm['modelV2']      # ← modelV2メッセージ
+        long_plan = self.sm['longitudinalPlan']
+
+        # 8-3. CarControlメッセージの作成
+        CC = car.CarControl.new_message()
+        CC.enabled = self.sm['selfdriveState'].enabled
+        CC.latActive = 横制御が有効か判定
+        CC.longActive = 縦制御が有効か判定
+
+        # 8-4. 横制御の更新
+        # ★ここでmodelV2のdesiredCurvatureを使用★
+        new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+
+        # 曲率の制限（急激な変化を抑制）
+        self.desired_curvature, curvature_limited = clip_curvature(
+            CS.vEgo,
+            self.desired_curvature,    # 前回の曲率
+            new_desired_curvature,     # 今回の目標曲率
+            lp.roll                     # ロール角
+        )
+
+        # actuatorsに設定
+        actuators.curvature = self.desired_curvature
+
+        # 8-5. LatControlを呼び出し
+        steer, steeringAngleDeg, lac_log = self.LaC.update(
+            CC.latActive,
+            CS,
+            self.VM,                      # VehicleModel
+            lp,                           # liveParameters
+            self.steer_limited_by_controls,
+            self.desired_curvature,       # ← ★これがモデルからの目標曲率★
+            self.calibrated_pose,
+            curvature_limited
+        )
+
+        # 8-6. 出力トルク/角度を設定
+        actuators.torque = float(steer)
+        actuators.steeringAngleDeg = float(steeringAngleDeg)
+
+        return CC, lac_log
+```
+
+---
+
+#### ステップ9: 横制御PIDでの処理（最終段階）
+
+```python
+# latcontrol_torque.py の LatControlTorque クラス
+class LatControlTorque:
+    def update(self, active, CS, VM, params, steer_limited_by_controls,
+               desired_curvature, calibrated_pose, curvature_limited):
+
+        if not active:
+            return 0.0, 0.0, pid_log
+
+        # 9-1. 現在の曲率を計算
+        actual_curvature = -VM.calc_curvature(
+            math.radians(CS.steeringAngleDeg - params.angleOffsetDeg),
+            CS.vEgo,
+            params.roll
+        )
+
+        # 9-2. 曲率から横加速度へ変換（物理の公式）
+        desired_lateral_accel = desired_curvature * CS.vEgo ** 2  # ← ★モデル出力を使用★
+        actual_lateral_accel = actual_curvature * CS.vEgo ** 2
+
+        # 9-3. 低速補正
+        low_speed_factor = np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y)**2
+        setpoint = desired_lateral_accel + low_speed_factor * desired_curvature
+        measurement = actual_lateral_accel + low_speed_factor * actual_curvature
+
+        # 9-4. 横加速度からトルクへ変換（車両固有の関数）
+        torque_from_setpoint = self.torque_from_lateral_accel(setpoint, ...)
+        torque_from_measurement = self.torque_from_lateral_accel(measurement, ...)
+
+        # 9-5. PID制御で追従
+        error = torque_from_setpoint - torque_from_measurement
+        output_torque = self.pid.update(
+            error,
+            feedforward=ff,
+            speed=CS.vEgo,
+            freeze_integrator=freeze_integrator
+        )
+
+        return -output_torque, 0.0, pid_log
+```
+
+---
+
+#### ステップ10: CANバスへの出力
+
+```python
+# card.py の Car クラス
+class Car:
+    def controls_update(self, CS, CC):
+        # 10-1. CarControllerを呼び出し
+        self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos)
+
+        # 10-2. CANメッセージ送信
+        self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan'))
+
+# carcontroller.py（車種固有）の例: Toyota
+class CarController:
+    def update(self, CC, CS, now_nanos):
+        actuators = CC.actuators
+
+        # 10-3. トルクをCANメッセージに変換
+        new_torque = int(round(actuators.torque * self.params.STEER_MAX))
+
+        # 10-4. レート制限・安全チェック
+        apply_torque = apply_meas_steer_torque_limits(
+            new_torque,
+            self.last_torque,
+            CS.out.steeringTorqueEps,
+            self.params
+        )
+
+        # 10-5. CANメッセージ作成
+        can_sends = []
+        steer_command = toyotacan.create_steer_command(
+            self.packer,
+            apply_torque,
+            apply_steer_req
+        )
+        can_sends.append(steer_command)
+
+        return actuators, can_sends
+```
+
+---
+
+#### 完全なデータフロー図（時系列）
+
+```
+時刻 t=0ms
+    ├─ [camerad] カメラ画像キャプチャ
+    │   └─ VisionIPC経由で共有メモリに格納
+    │
+    ▼
+時刻 t=5ms
+    ├─ [modeld] 画像受信
+    │   ├─ 変換行列適用
+    │   └─ GPU/OpenCLメモリにコピー
+    │
+    ▼
+時刻 t=10ms
+    ├─ [Vision Model] 推論開始
+    │   ├─ CNN層で特徴抽出
+    │   └─ hidden_state[512]生成
+    │
+    ▼
+時刻 t=20ms
+    ├─ [Vision Model] 推論完了
+    │   ├─ hidden_stateをバッファに追加
+    │   └─ 時系列サンプリング（5Hz）
+    │
+    ▼
+時刻 t=25ms
+    ├─ [Policy Model] 推論開始
+    │   ├─ LSTM/Transformerで時系列処理
+    │   └─ Attention機構適用
+    │
+    ▼
+時刻 t=30ms
+    ├─ [Policy Model] 推論完了
+    │   └─ desired_curvature生成 ← ★これが横制御の目標★
+    │
+    ▼
+時刻 t=35ms
+    ├─ [modeld] アクション生成
+    │   ├─ スムージング処理
+    │   └─ modelV2メッセージ作成
+    │
+    ▼
+時刻 t=40ms
+    ├─ [msgq] modelV2配信
+    │   └─ controlsd, plannerd等が受信
+    │
+    ▼
+時刻 t=41ms～50ms (100Hz制御ループ)
+    ├─ [controlsd] 受信
+    │   ├─ desired_curvatureを取得
+    │   ├─ 曲率制限・クリップ
+    │   └─ LatControlに渡す
+    │
+    ├─ [LatControl] PID制御
+    │   ├─ 曲率 → 横加速度 変換
+    │   ├─ 横加速度 → トルク 変換
+    │   ├─ PID演算（誤差補正）
+    │   └─ output_torque生成
+    │
+    ├─ [CarController] CAN送信
+    │   ├─ トルク値をCAN形式に変換
+    │   ├─ レート制限・安全チェック
+    │   └─ CANメッセージ送信
+    │
+    └─ [CAN Bus] → [車両EPS]
+        └─ ステアリング制御実行
+```
+
+---
+
+#### まとめ: 画像から制御までの処理時間
+
+| ステップ | 処理内容 | 時間 | 累計 |
+|---------|---------|------|------|
+| 1 | カメラ画像取得 | 0ms | 0ms |
+| 2 | 画像前処理・変換 | ~5ms | 5ms |
+| 3 | Vision Model推論 | ~10ms | 15ms |
+| 4 | バッファ管理 | ~1ms | 16ms |
+| 5 | Policy Model推論 | ~5ms | 21ms |
+| 6 | アクション生成 | ~2ms | 23ms |
+| 7 | メッセージ配信 | ~1ms | 24ms |
+| 8 | controlsd受信・処理 | ~1ms | 25ms |
+| 9 | 横制御PID演算 | ~1ms | 26ms |
+| 10 | CAN送信 | ~1ms | 27ms |
+
+**合計レイテンシ: 約27ms**（カメラキャプチャから車両への指令まで）
+
+これは人間の反応時間（約200-300ms）と比較して非常に高速です。
+
+#### フェーズ3: 経路計画
+
+**プロセス**: `plannerd.py` (selfdrive/controls/)
+
+##### 縦方向の計画 (LongitudinalPlanner)
+
+**ファイル**: `selfdrive/controls/lib/longitudinal_planner.py`
+
+**【重要】縦制御の2段階構造を理解する**
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 上位層: MPC (Model Predictive Control)              │
+│ - 役割: 最適な加速度軌道を計画                        │
+│ - 入力: modelV2, radarState, v_cruise              │
+│ - 出力: aTarget（目標加速度の時系列）                 │
+│ - 処理: 快適性・安全性・燃費を考慮した最適化           │
+└───────────────────┬─────────────────────────────────┘
+                    │ aTarget
+                    ▼
+┌─────────────────────────────────────────────────────┐
+│ 下位層: PID Controller                              │
+│ - 役割: aTargetに追従する実際の制御入力を生成        │
+│ - 入力: aTarget, 現在の加速度 aEgo                  │
+│ - 出力: accel（車両に送る加速度指令）                │
+│ - 処理: 誤差をPID制御で補正                          │
+└─────────────────────────────────────────────────────┘
+```
+
+```python
+class LongitudinalPlanner:
+    def update(self, sm):
+        # 1. モデルデータの解析
+        x, v, a, j, throttle_prob = self.parse_model(sm['modelV2'], self.v_model_error)
+
+        # 2. MPCソルバーで最適軌道計算（上位層）
+        self.mpc.update(sm['radarState'], v_cruise, x, v, a, j, personality)
+
+        # 3. 制御用の軌道を補間して aTarget を生成
+        self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
+        self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
+```
+
+**Longitudinal MPC (Model Predictive Control) - 上位層の計画**:
+- **目的関数**: 快適性（加加速度最小化）、安全性（車間距離維持）、燃費（無駄な加減速回避）のバランス
+- **制約条件**: 最大加速度、最小減速度、車間距離、速度制限
+- **予測ホライズン**: 約10秒先まで予測
+- **更新周期**: 20Hz（modelV2の更新に同期）
+- **出力**: 最適な速度・加速度軌道（時系列データ）
+
+**なぜ2段階構造なのか？**
+- **MPC**: 将来を予測して「どう動くべきか」を計画（高レベル判断）
+- **PID**: 現在の状態から「どう制御すべきか」を実行（低レベル追従）
+- 役割分担により、計画と実行を分離し、ロバスト性と最適性を両立
+longitudinalPlan.vTarget      # 目標速度 (m/s)
+longitudinalPlan.shouldStop   # 停止すべきか
+longitudinalPlan.hasLead      # 前方に車両がいるか
+longitudinalPlan.speeds[]     # 速度プロファイル
+```
+
+**データの流れ**:
+```
+[modelV2 + radarState + carState] → LongitudinalPlanner
+                                           ↓
+                                    Longitudinal MPC
+                                           ↓
+                                    longitudinalPlan ── publish → msgq
+```
+
+#### フェーズ4: 車両制御
+
+**プロセス**: `controlsd.py` (selfdrive/controls/)
+
+##### メインループ（100Hz実行）
+
+```python
+class Controls:
+    def state_control(self):
+        CS = self.sm['carState']
+        long_plan = self.sm['longitudinalPlan']
+        model_v2 = self.sm['modelV2']
+
+        # 1. CarControlメッセージの作成
+        CC = car.CarControl.new_message()
+        CC.enabled = self.sm['selfdriveState'].enabled
+        CC.latActive = 横制御が有効か判定
+        CC.longActive = 縦制御が有効か判定
+
+        # 2. 縦制御（LongControl）の更新
+        actuators.accel = self.LoC.update(
+            CC.longActive, CS,
+            long_plan.aTarget,      # 目標加速度
+            long_plan.shouldStop,   # 停止フラグ
+            pid_accel_limits        # 加速度制限
+        )
+
+        # 3. 横制御（LatControl）の更新
+        actuators.curvature = self.desired_curvature
+        steer, steeringAngleDeg, lac_log = self.LaC.update(
+            CC.latActive, CS, self.VM,
+            lp, self.steer_limited_by_controls,
+            self.desired_curvature,  # 目標曲率
+            self.calibrated_pose,
+            curvature_limited
+        )
+        actuators.torque = float(steer)
+        actuators.steeringAngleDeg = float(steeringAngleDeg)
+
+        return CC, lac_log
+```
+
+##### 縦制御の詳細 (LongControl) - 下位層の追従制御
+
+**ファイル**: `selfdrive/controls/lib/longcontrol.py`
+
+**【重要】LongControlの役割**
+- **入力**: `aTarget`（MPCが計画した目標加速度）
+- **現在値**: `CS.aEgo`（実際の車両加速度）
+- **出力**: `accel`（車両に送る制御指令）
+- **役割**: PID制御で目標に追従
+
+```python
+class LongControl:
+    def update(self, active, CS, a_target, should_stop, accel_limits):
+        # 状態機械による制御モード切り替え
+        self.long_control_state = long_control_state_trans(
+            self.CP, active, self.long_control_state,
+            CS.vEgo, should_stop, CS.brakePressed,
+            CS.cruiseState.standstill
+        )
+
+        if self.long_control_state == LongCtrlState.stopping:
+            # 停止中: 減速して停止
+            output_accel = self.last_output_accel
+            if output_accel > self.CP.stopAccel:
+                output_accel -= self.CP.stoppingDecelRate * DT_CTRL
+
+        elif self.long_control_state == LongCtrlState.starting:
+            # 発進: 事前設定された加速度
+            output_accel = self.CP.startAccel
+
+        else:  # LongCtrlState.pid
+            # PID制御: 目標加速度 aTarget に追従
+            error = a_target - CS.aEgo  # 目標と実際の差
+            output_accel = self.pid.update(
+                error,
+                speed=CS.vEgo,
+                feedforward=a_target  # フィードフォワード項
+            )
+
+        return np.clip(output_accel, accel_limits[0], accel_limits[1])
+```
+
+**縦制御の状態機械**:
+```
+      ┌─────────┐
+      │   off   │ ← 非アクティブ時
+      └────┬────┘
+           │ 有効化
+           ▼
+      ┌─────────┐     should_stop=True      ┌──────────┐
+      │   pid   │ ────────────────────────→ │ stopping │
+      │(通常走行)│ ←──────────────────────── │  (停止)  │
+      └────┬────┘     starting_condition     └──────────┘
+           │                                        │
+           │ v_ego < startingSpeed                 │
+           ▼                                        │
+      ┌─────────┐                                  │
+      │starting │                                  │
+      │ (発進)  │ ←────────────────────────────────┘
+      └─────────┘        starting_condition
+```
+
+**PID制御の詳細**:
+```python
+# PIDController.update()
+error = a_target - CS.aEgo        # 目標加速度 - 実際の加速度
+
+p = Kp * error                    # 比例項（現在の誤差に比例）
+i += Ki * error * dt              # 積分項（累積誤差を解消）
+d = Kd * (error - prev_error) / dt  # 微分項（誤差の変化を抑制）
+f = Kf * feedforward              # フィードフォワード項（目標値を直接利用）
+
+output = p + i + d + f
+```
+
+**各項の意味**:
+- **P項**: 現在のズレを即座に修正（応答性）
+- **I項**: 長期的なズレを徐々に解消（定常偏差除去）
+- **D項**: 急激な変化を抑制（安定性）
+- **F項**: 目標値を先読みして制御（追従性向上）
+
+**縦制御のまとめ**:
+```
+MPC (plannerd) → aTarget（目標加速度軌道）
+                    ↓
+PID (controlsd) → accel（実制御指令）
+                    ↓
+             車両に送信
+```
+
+##### 横制御の詳細 (LatControl)
+
+**【重要】横制御の基本的な考え方**
+
+横制御は以下の流れで動作します：
+
+```
+目標曲率 → 目標横加速度 → 必要なトルク/角度 → PID制御 → 車両への指令
+(modelV2)     (物理計算)      (車両モデル)     (誤差補正)    (CAN送信)
+```
+
+openpilotは**3種類の横制御方式**をサポート：
+
+---
+
+**1. Torque制御 (LatControlTorque)** ← 最も一般的
+
+**ファイル**: `selfdrive/controls/lib/latcontrol_torque.py`
+
+**制御の流れ**:
+```
+① desired_curvature（目標曲率）
+        ↓ × vEgo²
+② desired_lateral_accel（目標横加速度）
+        ↓ torque_from_lateral_accel()
+③ desired_torque（目標トルク）
+        ↓
+     [PID制御]
+        ↓ 誤差補正
+④ output_torque（実際の指令トルク）
+        ↓
+    車両のEPSへ
+```
+
+**実装の詳細**:
+```python
+class LatControlTorque:
+    def update(self, active, CS, VM, params, steer_limited_by_controls,
+               desired_curvature, calibrated_pose, curvature_limited):
+
+        # 1. 現在の曲率を計算（2つの方法）
+        #    方法A: ステアリング角から推定
+        actual_curvature_vm = -VM.calc_curvature(
+            math.radians(CS.steeringAngleDeg - params.angleOffsetDeg),
+            CS.vEgo, params.roll
+        )
+        #    方法B: IMUの角速度から推定（高速時に使用）
+        actual_curvature_pose = calibrated_pose.angular_velocity.yaw / CS.vEgo
+
+        # 速度に応じて方法A/Bを補間
+        actual_curvature = np.interp(CS.vEgo, [2.0, 5.0],
+                                    [actual_curvature_vm, actual_curvature_pose])
+
+        # 2. 曲率から横加速度へ変換（運動学の公式）
+        desired_lateral_accel = desired_curvature * CS.vEgo ** 2
+        actual_lateral_accel = actual_curvature * CS.vEgo ** 2
+
+        # 3. 低速補正（低速時は曲率の効果が小さいため補正）
+        low_speed_factor = np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y)**2
+        setpoint = desired_lateral_accel + low_speed_factor * desired_curvature
+        measurement = actual_lateral_accel + low_speed_factor * actual_curvature
+
+        # 4. 横加速度からトルクへ変換（車両固有の関数）
+        #    LatAccelFactor, LatAccelOffset, Friction を考慮
+        torque_from_setpoint = self.torque_from_lateral_accel(setpoint, ...)
+        torque_from_measurement = self.torque_from_lateral_accel(measurement, ...)
+
+        # 5. PID制御で誤差を補正
+        error = torque_from_setpoint - torque_from_measurement
+        output_torque = self.pid.update(
+            error,
+            feedforward=ff,  # フィードフォワード項
+            speed=CS.vEgo
+        )
+
+        return -output_torque, 0.0, pid_log
+```
+
+**重要な物理計算**:
+
+1. **曲率から横加速度への変換**:
+   ```
+   lateral_accel = curvature × velocity²
+   ```
+   - 曲率が大きい（急カーブ）ほど横加速度が大きい
+   - 速度が速いほど横加速度が大きい（同じカーブでも）
+
+2. **横加速度からトルクへの変換**:
+   ```
+   torque = (lateral_accel × latAccelFactor + latAccelOffset) + friction
+   ```
+   - 車両ごとに異なるパラメータ（latAccelFactor, latAccelOffset）
+   - ステアリングの摩擦を考慮（friction）
+
+3. **低速補正**:
+   - 低速時は横加速度だけでなく、曲率自体も制御に使用
+   - タイヤのスリップ特性が速度で変化するため
+
+---
+
+**2. Angle制御 (LatControlAngle)**
+
+**使用車両**: 一部のTSS2車両（Toyota Safety Sense 2.0）
+
+**制御の流れ**:
+```
+desired_curvature → desired_angle（目標ステアリング角）
+                           ↓
+                    角度指令として直接送信
+                           ↓
+                        車両のEPS
+```
+
+- トルク制御より直接的（EPSが角度制御をサポートしている場合）
+- 応答性が良い
+
+---
+
+**3. PID制御 (LatControlPID)**
+
+**使用車両**: 旧世代の車両
+
+**制御の流れ**:
+```
+desired_curvature vs actual_curvature
+        ↓ 誤差
+     [PID制御]
+        ↓
+   output_torque
+```
+
+- シンプルなPID制御（Torque制御より単純）
+- 横加速度への変換をスキップ
+
+---
+
+**横制御のまとめ**:
+
+| 制御方式 | 入力 | 変換 | 出力 | 特徴 |
+|---------|-----|------|------|------|
+| **Torque** | 曲率 | 曲率→横加速度→トルク | トルク | 最も一般的、物理モデルベース |
+| **Angle** | 曲率 | 曲率→角度 | 角度 | TSS2車両、直接的 |
+| **PID** | 曲率 | なし | トルク | 旧世代、シンプル |
+
+**Q2の回答**:
+横制御は、AIが出力する「目標曲率（どれくらい曲がるべきか）」を、
+「横加速度」→「必要なトルク」へと物理計算で変換し、
+最後にPID制御で現在値との誤差を補正して、車両のステアリングに指令を送る仕組みです。
+
+```python
+CC.enabled             # openpilot有効
+CC.latActive           # 横制御有効
+CC.longActive          # 縦制御有効
+
+CC.actuators.accel            # 目標加速度 (m/s^2)
+CC.actuators.torque           # ステアリングトルク (Nm)
+CC.actuators.steeringAngleDeg # ステアリング角度 (度)
+CC.actuators.curvature        # 目標曲率 (1/m)
+
+CC.hudControl.setSpeed        # HUD表示速度
+CC.hudControl.visualAlert     # 警告表示
+CC.cruiseControl.cancel       # クルーズキャンセル
+```
+
+#### フェーズ5: CAN出力
+
+**プロセス**: `card.py` → `CarController`
+
+```python
+# card.py
+def controls_update(self, CS, CC):
+    if self.sm.all_alive(['carControl']):
+        # CarControllerを呼び出してCANメッセージ生成
+        self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos)
+
+        # CANメッセージ送信
+        self.pm.send('sendcan', can_list_to_can_capnp(can_sends, ...))
+```
+
+**CarController (車種固有実装)**
+
+例: Toyotaの場合 (`opendbc/car/toyota/carcontroller.py`)
+
+```python
+class CarController:
+    def update(self, CC, CS, now_nanos):
+        actuators = CC.actuators
+
+        # 1. ステアリングトルクの適用
+        new_torque = int(round(actuators.torque * self.params.STEER_MAX))
+        apply_torque = apply_meas_steer_torque_limits(
+            new_torque, self.last_torque,
+            CS.out.steeringTorqueEps, self.params
+        )
+
+        # 2. CANメッセージ作成
+        can_sends = []
+        steer_command = toyotacan.create_steer_command(
+            self.packer, apply_torque, apply_steer_req
+        )
+        can_sends.append(steer_command)
+
+        # 3. 加速度制御（車種により実装が異なる）
+        if self.CP.openpilotLongitudinalControl:
+            # PCM (Powertrain Control Module) に加速度指令を送る
+            accel_command = toyotacan.create_accel_command(
+                self.packer, actuators.accel, ...
+            )
+            can_sends.append(accel_command)
+
+        return actuators, can_sends
+```
+
+**データの流れ**:
+```
+[CarControl] → CarController.update()
+                      ↓
+              CANメッセージ生成
+                      ↓
+              apply限界値チェック
+                      ↓
+              rate limit適用
+                      ↓
+              [CAN送信] → pandad → 車両ECU
+```
+
+### 8.3 制御ループのタイミング
+
+```
+         0ms      10ms     20ms     30ms     40ms     50ms
+          │        │        │        │        │        │
+card      ●────────●────────●────────●────────●────────●  100Hz
+          │        │        │        │        │        │
+controlsd ●────────●────────●────────●────────●────────●  100Hz
+          │        │        │        │        │        │
+plannerd       ●───────────────●───────────────●──────     20Hz (modelV2駆動)
+          │        │        │        │        │        │
+modeld    ●────────────────────────●──────────────────     20Hz
+```
+
+**各プロセスの実行周期**:
+- **card**: 100Hz（10ms） - CAN受信駆動
+- **controlsd**: 100Hz（10ms） - 制御ループ
+- **plannerd**: 20Hz（50ms） - modelV2更新駆動
+- **modeld**: 20Hz（50ms） - カメラフレームレート
+
+### 8.4 完全なデータフローチャート
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         センサー入力                              │
+└───────────┬─────────────────────────────────────────────────────┘
+            │
+   ┌────────┴────────┐
+   │                 │
+   ▼                 ▼
+[CAN Bus]        [Camera]
+   │                 │
+   ▼                 ▼
+pandad           camerad
+   │                 │
+   ▼                 ▼
+ card.py         modeld.py
+   │                 │
+   │  carState       │  modelV2
+   │  ────────┐      │  ────────┐
+   │          │      │          │
+   ▼          │      ▼          │
+radarState    │  calibrationd   │
+   │          │      │          │
+   └──────┬───┴──────┴──┬───────┘
+          │             │
+          ▼             ▼
+    ┌──────────────────────┐
+    │    plannerd.py       │
+    │                      │
+    │ LongitudinalPlanner  │
+    │   ↓                  │
+    │ Longitudinal MPC     │
+    └──────────┬───────────┘
+               │
+               │ longitudinalPlan
+               │ (aTarget, vTarget, shouldStop)
+               │
+               ▼
+    ┌──────────────────────┐
+    │   controlsd.py       │
+    │                      │
+    │  ┌────────────────┐  │
+    │  │  LongControl   │  │  ← longitudinalPlan
+    │  │   (PID制御)    │  │  ← carState
+    │  └────────┬───────┘  │
+    │           │          │
+    │           ├─ accel   │
+    │           │          │
+    │  ┌────────┴───────┐  │
+    │  │   LatControl   │  │  ← modelV2.desiredCurvature
+    │  │  (Torque/Angle)│  │  ← carState
+    │  └────────┬───────┘  │
+    │           │          │
+    │           ├─ torque  │
+    │           ├─ steeringAngleDeg
+    │           │          │
+    └───────────┼──────────┘
+                │
+                │ carControl
+                │ (CC.actuators.accel, CC.actuators.torque)
+                │
+                ▼
+    ┌──────────────────────┐
+    │      card.py         │
+    │  controls_update()   │
+    │         ↓            │
+    │   CarController      │
+    │    (車種固有)        │
+    └──────────┬───────────┘
+               │
+               │ CANメッセージ
+               │
+               ▼
+           ┌───────┐
+           │pandad │
+           └───┬───┘
+               │
+               ▼
+           [CAN Bus]
+               │
+               ▼
+        ┌──────────────┐
+        │   車両ECU    │
+        │              │
+        │ ・EPS (ハンドル)│
+        │ ・PCM (加速)   │
+        │ ・ブレーキ     │
+        └──────────────┘
+```
+
+### 8.5 Jetson Nano移植のための重要ポイント
+
+#### ハードウェア依存部分の特定
+
+**1. CAN通信 (Panda依存)**
+```
+[必要な機能]
+- CAN受信: 車両状態の読み取り
+- CAN送信: 制御コマンドの送信
+
+[代替案]
+- SocketCANの利用（Linux標準）
+- USB-CANアダプタ（PEAK, Kvaser等）
+```
+
+**2. カメラ入力**
+```
+[Comma3X]
+- 専用カメラモジュール
+- camerad (ネイティブプロセス)
+
+[Jetson Nano代替]
+- USB/CSIカメラ
+- OpenCVまたはGStreamerでキャプチャ
+- cameradの書き換えが必要
+```
+
+**3. センサー入力**
+```
+[Comma3X依存]
+- sensord: IMU、GPS
+- ubloxd: u-blox GPS
+
+[Jetson Nano代替]
+- 外部IMU (MPU6050等)をI2C/SPI接続
+- USB GPSモジュール
+- sensordの書き換えが必要
+```
+
+#### ソフトウェア依存部分
+
+**最小限の動作に必要なプロセス**:
+
+```python
+# 必須プロセス（縦制御・横制御のみ）
+必須 = [
+    "pandad",      # → SocketCANドライバーに置き換え
+    "card",        # 車種固有のCAN解析
+    "camerad",     # → USB/CSIカメラ対応に書き換え
+    "modeld",      # AI推論（要GPU）
+    "plannerd",    # 経路計画
+    "controlsd",   # 車両制御
+]
+
+# 省略可能なプロセス（デバッグ時）
+省略可能 = [
+    "loggerd",     # ログ記録
+    "ui",          # UI表示
+    "manage_athenad",  # クラウド通信
+    "uploader",    # ログアップロード
+    # ... その他多数
+]
+```
+
+#### シミュレーション環境での動作確認
+
+**方法1: replay機能を使う**
+```bash
+# 既存のログデータでプロセスをリプレイ
+export REPLAY=1
+./selfdrive/controls/controlsd.py
+```
+
+**方法2: モックCarStateを使う**
+```python
+# card.pyでモックデータ生成
+if self.CP.brand == 'mock':
+    CS = self.mock_carstate.update(CS)
+```
+
+**方法3: SocketCANシミュレータ**
+```bash
+# 仮想CANインターフェース作成
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
+
+# CANメッセージのシミュレーション
+cangen vcan0
+```
+
+#### 制御ロジックの抽出
+
+**車両制御のコアロジックは車種非依存**:
+
+```
+selfdrive/controls/controlsd.py        ← 汎用制御ロジック
+selfdrive/controls/lib/longcontrol.py  ← 縦制御PID
+selfdrive/controls/lib/latcontrol_*.py ← 横制御PID/Torque
+selfdrive/controls/plannerd.py         ← 経路計画
+```
+
+**車種依存部分**:
+```
+opendbc/car/[brand]/carcontroller.py   ← CAN送信
+opendbc/car/[brand]/carstate.py        ← CAN受信
+opendbc/car/[brand]/interface.py       ← パラメータ定義
+```
+
+**Jetson Nano移植ステップ**:
+
+1. **ステップ1**: SocketCANドライバーの実装
+   - `pandad`の置き換え
+   - CAN送受信インターフェース
+
+2. **ステップ2**: カメラ入力の実装
+   - USB/CSIカメラサポート
+   - `camerad`の書き換え
+
+3. **ステップ3**: モデル推論の最適化
+   - TensorRTでの最適化
+   - Jetson GPU活用
+
+4. **ステップ4**: 制御ロジックの検証
+   - シミュレーション環境でテスト
+   - ログデータでの検証
+
+5. **ステップ5**: 実車テスト
+   - 安全な環境での動作確認
+   - パラメータチューニング
+
+### 8.6 重要な設定ファイル
+
+**CarParams (CP)**
+
+車両固有のパラメータ定義：
+
+```python
+CP.mass                    # 車両重量 (kg)
+CP.wheelbase               # ホイールベース (m)
+CP.steerRatio              # ステアリングギア比
+CP.centerToFront           # 重心から前軸までの距離 (m)
+
+# 制御パラメータ
+CP.lateralTuning.pid.kpV   # 横制御PIDゲイン
+CP.lateralTuning.pid.kiV
+CP.longitudinalTuning.kpV  # 縦制御PIDゲイン
+CP.longitudinalTuning.kiV
+
+# ハードウェア能力
+CP.minSteerSpeed           # 最低操舵速度 (m/s)
+CP.maxSteeringAngleDeg     # 最大ステアリング角 (度)
+CP.openpilotLongitudinalControl  # 縦制御の可否
+```
+
+## 9. まとめ
+
+openpilotの実行フローは以下のように整理できます：
+
+1. **起動**: シェルスクリプト → Manager起動
+2. **初期化**: デバイス登録、ログ設定、プロセス準備
+3. **メインループ**: 走行状態監視 → プロセス管理
+4. **プロセス間通信**: msgq（共有メモリベースPub/Sub）
+5. **制御ループ**: センサー入力 → 認識 → 計画 → 制御 → 出力
+
+### 車両制御のデータフロー（サマリ）
+
+```
+CAN → carState → modelV2 → longitudinalPlan → carControl → CANコマンド
+                     ↓                             ↓
+                 (AI推論)                    (PID制御)
+```
+
+この構造により、openpilotは高い拡張性と保守性を保ちながら、リアルタイム性が求められる自動運転システムを実現しています。
+
+Jetson Nanoへの移植においては、**制御ロジックは汎用的**であり、**ハードウェアインターフェース部分のみ**を置き換えれば動作する設計になっています。
