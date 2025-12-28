@@ -3,9 +3,9 @@
 このドキュメントでは、openpilotのUI（ユーザーインターフェース）システムの詳細と、カスタマイズ方法を説明します。
 
 > **📖 関連ドキュメント**
-> - [実行フロー概要](../execution-flow-ja.md) - 全体の流れ
-> - [controlsd詳細](controlsd-details.md) - 車両制御システム
-> - [MLモデル詳細](ml-models-details.md) - Vision/Policy Model
+> - [README](README.md) - openpilot分析ドキュメントの全体構成
+> - [controlsd-details.md](controlsd-details.md) - 車両制御システム
+> - [ml-models-details.md](ml-models-details.md) - Vision/Policy Model
 
 ---
 

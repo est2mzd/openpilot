@@ -3,8 +3,8 @@
 このドキュメントでは、openpilotのManager（マネージャー）の実装詳細を説明します。
 
 > **📖 関連ドキュメント**
-> - [実行フロー概要](../execution-flow-ja.md) - 全体の流れ
-> - [msgq詳細](msgq-details.md) - プロセス間通信
+> - [README](README.md) - openpilot分析ドキュメントの全体構成
+> - [../msgq_analysis/runtime_details.md](../msgq_analysis/runtime_details.md) - プロセス間通信
 > - [プロセス管理詳細](#3-プロセス管理の詳細) - 下部セクション
 
 

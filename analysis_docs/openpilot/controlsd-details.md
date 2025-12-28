@@ -3,10 +3,10 @@
 このドキュメントでは、openpilotの車両制御システム「controlsd」の詳細を説明します。
 
 > **📖 関連ドキュメント**
-> - [実行フロー概要](../execution-flow-ja.md) - 全体の流れ
-> - [MLモデル詳細](ml-models-details.md) - Vision/Policy Modelの入出力
-> - [Manager詳細](manager-details.md) - プロセス管理
-> - [msgq詳細](msgq-details.md) - プロセス間通信
+> - [README](README.md) - openpilot分析ドキュメントの全体構成
+> - [ml-models-details.md](ml-models-details.md) - Vision/Policy Modelの入出力
+> - [manager-details.md](manager-details.md) - プロセス管理
+> - [../msgq_analysis/runtime_details.md](../msgq_analysis/runtime_details.md) - プロセス間通信
 
 ---
 

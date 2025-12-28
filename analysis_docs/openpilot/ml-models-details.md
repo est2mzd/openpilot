@@ -3,9 +3,7 @@
 このドキュメントでは、openpilotのMLモデル（Vision Model + Policy Model）の詳細を説明します。
 
 > **📖 関連ドキュメント**
-> - [実行フロー概要](../execution-flow-ja.md) - 全体の流れ
-> - [車両制御詳細](vehicle-control-details.md) - 制御アルゴリズム
-> - **📊 モデル可視化**: [models/](../models/) - ONNXモデルの構造図
+> - [ONNXモデル分析結果](onnx-analysis-results.md) - 自動生成されたモデル構造の詳細データ
 
 ---
 

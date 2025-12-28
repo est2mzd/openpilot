@@ -1,14 +1,15 @@
-# msgq（メッセージキュー）詳細
+# msgq 実行時の詳細
 
-このドキュメントでは、openpilotのプロセス間通信システム「msgq」の実装詳細を説明します。
+このドキュメントでは、openpilotのプロセス間通信システム「msgq」の**実行時の動作**と**共有メモリ構造**を説明します。
 
 > **📖 関連ドキュメント**
-> - [実行フロー概要](../execution-flow-ja.md) - 全体の流れ
-> - [Manager詳細](manager-details.md) - プロセス管理
+> - [msgq リポジトリ構造](README.md) - コード構成と実装バックエンド
+> - [ipc.md](ipc.md) - IPC API の詳細
+> - [implementations.md](implementations.md) - ZMQ/msgq/fake 実装の比較
 
-## 1. msgqの概要
+## 1. msgq実装の実行時動作
 
-**msgq**（message queue）は、openpilot独自の高速プロセス間通信システムです。
+**msgq実装**（`impl_msgq`）は、openpilot独自の高速プロセス間通信システムです。
 
 ### 1.1 特徴
 
